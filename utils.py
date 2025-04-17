@@ -17,51 +17,48 @@ from shapely.geometry import mapping
 from shapely.ops import unary_union  
 import re
 import datetime
+from datetime import datetime as dt
 import matplotlib.pyplot as plt
 import progressbar
 
 
 
-def dateFromFileName(string, date_format = '%Y%m%dT%H%M%S', 
-                     regex_pattern = r'\d{8}T\d{6}' ):
+def dateFromFileName(string, 
+                     date_formats=('%Y%m%dT%H%M%S', '%Y%m%d'), 
+                     regex_patterns=(r'\d{8}T\d{6}', r'\d{8}')):
     """
-    Extracts a date from a filename string based on a specific date-time format.
-    
+    Extracts a date from a filename string based on specific date-time formats.
+
     Parameters:
     -----------
     string : str
-        The filename (or string) from which to extract the date. It should contain a date-time substring
-        in the format 'YYYYMMDDTHHMMSS'.
-    date_format : str, default is %Y%m%dT%H%M%S
-        The date format 
-    regex_pattern : str, default is r'\d{8}T\d{6}'
-        The pattern that will match the general format of 'YYYYMMDDTHHMMSS or 
-        another pattern defined by the user.
-        
+        The filename (or string) from which to extract the date. It should contain 
+        a date-time substring in one of the expected formats.
+    date_formats : tuple, default is ('%Y%m%dT%H%M%S', '%Y%m%d')
+        The possible date formats.
+    regex_patterns : tuple, default is (r'\d{8}T\d{6}', r'\d{8}')
+        Patterns matching the date formats.
+
     Returns:
     --------
     date : datetime.date
         A `datetime.date` object representing the extracted date (YYYY-MM-DD).
-    
+
     Raises:
     -------
-    ValueError : If the date format is not found in the string or is malformed.
+    ValueError : If no valid date is found in the string.
     """
-    # Search for the date-time string
-    match = re.search(regex_pattern, string)
-    
-    if not match:
-        raise ValueError(f"Date-time not found in the string: {string}")
-    
-    # Extract the date-time string
-    date_string = match.group()
-    
-    # Convert the extracted string to a datetime object and return the date part
-    date = datetime.datetime.strptime(date_string, date_format).date()
-    return date
+
+    for regex_pattern, date_format in zip(regex_patterns, date_formats):
+        match = re.search(regex_pattern, string)
+        if match:
+            date_string = match.group()
+            return datetime.datetime.strptime(date_string, date_format).date()
+
+    raise ValueError(f"No valid date found in the string: {string}")
 
 
-
+    
 def get_sca_metrics(array, snow, nosnow, cloud, nodata):
     """
     Computes Snow Cover Area (SCA) metrics from a classified raster array.
@@ -71,8 +68,9 @@ def get_sca_metrics(array, snow, nosnow, cloud, nodata):
     array : np.ndarray
         A NumPy array representing the classified raster dataset, where each pixel 
         has a classification value (e.g., snow, no snow, cloud, or no data).
-    snow : int or float
-        The pixel value representing snow in the classification.
+    snow : int or float or list
+        The pixel value representing snow in the classification. If a list, it 
+        is interpreted as a fractional snow cover map.
     nosnow : int or float
         The pixel value representing no snow (bare ground or other land cover).
     cloud : int or float
@@ -89,13 +87,23 @@ def get_sca_metrics(array, snow, nosnow, cloud, nodata):
         - `SCA`: Snow Cover Area percentage including clouds.
         - `SCA_error`: Estimated error in the snow percentage due to cloud coverage.
     """
+    
     # Compute pixel counts
-    cloudPixels = np.sum(np.logical_or(array == cloud, array == nodata))
-    snowPixels = np.sum(array == snow)
+    cloudPixels = np.sum(array == cloud)
+    nodataPixels = np.sum(array == nodata)
+
+    if type(snow) is list:
+        validPixels = np.sum(array <= snow[1]) 
+        snowPixels = np.mean(array[array <= snow[1]]) * validPixels/100
+        nosnowPixels = (100 - np.mean(array[array <= snow[1]])) * validPixels/100
+
+    else:
+        snowPixels = np.sum(array == snow)
+        nosnowPixels = np.sum(array == nosnow)
+
     snowPixels_max = snowPixels + cloudPixels
     snowPixels_min = snowPixels
-    nosnowPixels = np.sum(array == nosnow)
-    nodataPixels = np.sum(array == nodata)
+
 
     # Compute total number of pixels
     N = float(snowPixels + cloudPixels + nosnowPixels + nodataPixels)
@@ -226,7 +234,17 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None):
             array = ds.sel(band=1).values  # Assuming the first band is of interest
             
             # Get the metrics from the array
-            d = get_sca_metrics(array, 1, 2, 3, 0)
+            if os.path.basename(snowMap).startswith('VNP10A1F'):
+                # 'snow': 0-100, nosnow': 0, 'cloud': 205, 'nodata': 255
+                d = get_sca_metrics(array, [0,100], 0, 205, 255)
+            elif os.path.basename(snowMap).startswith('EURAC_SNOW'):
+                # 'snow': 1, nosnow': 2, 'cloud': 3, 'nodata': 0
+                d = get_sca_metrics(array, 1, 2, 3, 0)
+            else: 
+                raise ValueError(f"Insert classification values for: {snowMap}")
+
+
+                
             new_data.append((date, d))
         
         except Exception as e:
@@ -360,136 +378,7 @@ def snow_bullettin(pathToCSV, date_start, date_end, work_folder, CCA_threshold=3
 
 
 
-def cloud_temporalFilter(fileList, dateList, cloud, nodata, output_root, water=None, waterMask_fileName=None, confidence=False,tmax=3):
-
-    # This function generate a cloud filtered map considering a time window of +- 2 days. Only pixel having snow
-    # (or no snow) in one image before and after inside this window will be cleared from cloud
-
-    # INPUTS:
-    # fileList: list of file names complete of path
-    # dateList: list of dates corresponding to the fileList (same order) in datetime
-    # cloud, nodata: cloud and nodata value
-    # output_root: output root name complete of path (e.g. /.../snowMap_). Date and '_cloudTempFil.tif' will be added to
-    #              the fileName of each map generated
-    # confidence: True if the confidence layer is present in band 2, False if confidence layer is not present
-    #
-    # OPTIONAL INPUTS:
-    # water: water value of the input and output
-    # waterMask_fileName: water mask filename complete of path (boolean raster)
-
-
-    # Read info from the first image
-    img_ref = gdal.Open(fileList[0])
-    Ncols = img_ref.RasterXSize
-    Nrows = img_ref.RasterYSize
-    geoTransform = img_ref.GetGeoTransform()
-    projection = img_ref.GetProjection()
-    colorTable = img_ref.GetRasterBand(1).GetColorTable()
-    #img = None
-
-    # Open the water mask
-    if waterMask_fileName is not None:
-        img = gdal.Open(waterMask_fileName)
-        water_mask = img.GetRasterBand(1).ReadAsArray()
-        img = None
-
-
-    # Run the temporal filter:
-    bar = progressbar.ProgressBar(len(dateList))
-    bar.start()
-    
-    
-    def fuse_adj_snowmap(file_list, dim, cloud, nodata):
-
-        # File list must be ordered by date
-        fused = np.zeros(dim,dtype=np.uint8) + cloud
-        for n in file_list:
-            img = gdal.Open(n)
-            snowMap = img.GetRasterBand(1).ReadAsArray()
-            cloudMask = np.logical_or(fused==cloud, fused==nodata)
-            fused[cloudMask] = snowMap[cloudMask]
-
-        return fused
-
-    for i,d in enumerate(dateList):
-
-        print( "Elaborating date: " + d.strftime('%Y%m%d%H%M%S'))
-
-        # Fuse the images acquired max tmax days before the current date d
-
-        # Find the list of pre-images to be fused
-        indexes = [n for n,x in enumerate(dateList) if x<d and x>=d-datetime.timedelta(days=tmax)]
-        if not indexes:
-            print( "Empty list!")
-
-        file_list = list(reversed(sorted([fileList[ix] for ix in (indexes)])))                
-        fused_pre = fuse_adj_snowmap(file_list, (Nrows, Ncols), cloud, nodata)
-
-        indexes = [n for n,x in enumerate(dateList) if x>d and x<=d+timedelta(days=tmax)]
-        if not indexes:
-            print ("Empty list!")
-
-        file_list = (sorted([fileList[ix] for ix in indexes]))
-        fused_post = fuse_adj_snowmap(file_list, (Nrows, Ncols), cloud, nodata)
-        
-
-
-
-        # Load the snow map of the time 0 and apply the temporal filter
-        snowMap_curr, conf_curr = load_snowMap_curr(d, dateList, fileList, (Nrows,Ncols), cloud, confidence)
-        if snowMap_curr is None:
-            bar.update(i + 1)
-            continue
-        cloudMask = np.logical_or(snowMap_curr==cloud, snowMap_curr==nodata)
-        if np.sum(cloudMask):
-            snowMap_fill = np.logical_and(cloudMask, fused_pre==fused_post)
-            snowMap_curr[snowMap_fill] = fused_pre[snowMap_fill]
-
-        # Mask and write the filtered map
-        if np.sum(snowMap_curr == cloud) < Nrows*Ncols:
-
-            # Mask the snow map with the water bodies
-            if water is not None:
-                if waterMask_fileName is not None:
-                    snowMap_curr[water_mask] = water
-                else:
-                    water_mask_curr = np.logical_or(snowMap_pre==water,snowMap_post==water)
-                    snowMap_curr[water_mask_curr] = water
-
-            # Write the filtered image to file
-            output_fileName = os.path.join(output_root + d.strftime('%Y%m%d%H%M%S') + '_sca_fused.tif')
-            img = gdal.GetDriverByName('GTiff').Create(output_fileName, Ncols, Nrows, 1, gdal.GDT_Byte)
-            img.SetGeoTransform(geoTransform)
-            img.SetProjection(projection)
-            img.GetRasterBand(1).WriteArray(snowMap_curr)
-            if colorTable is not None:
-                img.GetRasterBand(1).SetColorTable(colorTable.Clone())
-            img = None
-
-            if confidence:
-                conf_curr[snowMap_fill] = conf_pre[snowMap_fill]
-                changeMask = np.logical_and(snowMap_fill, conf_post<conf_pre)
-                conf_curr[changeMask] = conf_post[changeMask]
-
-                # Write the filtered image to file
-                outputConf_fileName = output_fileName[:-4] + '_conf.tif'
-                img = gdal.GetDriverByName('GTiff').Create(outputConf_fileName, Ncols, Nrows, 1, gdal.GDT_Float32)
-                img.SetGeoTransform(geoTransform)
-                img.SetProjection(projection)
-                img.GetRasterBand(1).WriteArray(conf_curr)
-                img = None
-
-                # Create the vrt
-                cmd = "gdalbuildvrt -separate " + output_fileName[:-4] + '_stack.vrt ' + output_fileName + " " + outputConf_fileName
-                os.system(cmd)
-
-        bar.update(i + 1)
-    bar.finish()
-    img_ref = None
- 
-    
-
-def load_stack_xarray(snowMap_fileNameList, shp_fileName):
+def load_stack_xarray(snowMap_fileNameList, shp_fileName=None):
     """
     Load and stack masked snow maps into an xarray DataArray with a time dimension.
 
@@ -540,11 +429,6 @@ def load_stack_xarray(snowMap_fileNameList, shp_fileName):
 
 
 
-
-
-
-
-
 def multitemporal_filter(data_array, window=2):
     """
     Applies a multitemporal filter to an xarray DataArray, checking a window of ±2 days.
@@ -557,7 +441,7 @@ def multitemporal_filter(data_array, window=2):
     - xarray.DataArray: Filtered DataArray with NaNs where conditions are met.
     """
     # Define values to mask
-    mask_values = [0, 3, 255]
+    mask_values = [0, 3, 5, 255]
     
     # Create mask
     mask = ~data_array.isin(mask_values)
@@ -587,38 +471,170 @@ def multitemporal_filter(data_array, window=2):
 
 
 
-def multitemporal_filter(data_array, window=2):
+def get_scd(snowMap_fileNameList, date_start, date_end, shp_fileName=None, window=2):
+    """
+    Computes the Snow Cover Duration (SCD) from a list of snow cover maps.
     
-    # Define values to mask
-    mask_values = [0, 3, 255]
+    Parameters:
+    -----------
+    snowMap_fileNameList : list of str
+        List of file paths for snow cover maps.
+    date_start : str
+        Start date in the format 'DD-MM-YYYY'.
+    date_end : str
+        End date in the format 'DD-MM-YYYY'.
+    shp_fileName : str, optional
+        Path to a shapefile for masking the data (default is None).
+    window : int, optional
+        Time window (in days) for extending the start and end dates (default is 2).
     
-    # Apply mask
-    mask = ~data_array.isin(mask_values)
-    masked_data = data_array.where(mask, np.nan)
+    Returns:
+    --------
+    xarray.DataArray
+        A dataset representing the computed Snow Cover Duration (SCD) [0-1].
+        Missing values are replaced with -999.
+    """
     
-    data_ffill = masked_data.ffill(dim='time', limit = window)
-    data_bfill = masked_data.bfill(dim='time', limit = window)
+    # Convert start and end dates to datetime.date objects
+    date_start = dt.strptime(date_start, '%d-%m-%Y').date() - datetime.timedelta(days=window)
+    date_end = dt.strptime(date_end, '%d-%m-%Y').date() + datetime.timedelta(days=window)
+    
+    # Extract dates and filter files
+    filtered_files = [
+        f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end
+    ]
+    
+    # Sort files by extracted date
+    sorted_files = sorted(filtered_files, key=dateFromFileName)
+    
+    snowMap_stack = load_stack_xarray(sorted_files, shp_fileName)
+    
+    # Create a complete time range since some dates might be missing
+    full_time = pd.date_range(start=date_start, end=date_end, freq="D")
+
+    # Reindex with full time and fill missing values with 255
+    snowMap_stack_filled = snowMap_stack.reindex(time=full_time, 
+                                                 fill_value=255)
+    
+    # MODIS
+    if os.path.basename(snowMap_fileNameList[0]).startswith('EURAC_SNOW'):   
+        # apply multi-temporal filter
+        snowMap_stack_fltd = multitemporal_filter(snowMap_stack_filled, window=window)
+    
+        # keep only snow and no snow values
+        # snow:1, nosnow:2
+        snowMap_stack_fltd = xr.where(snowMap_stack_fltd == 1, 1, 
+                                      xr.where(snowMap_stack_fltd == 2, 0, np.nan))
+        
+        # interpolate over time
+        snowMap_stack_interp = snowMap_stack_fltd.interpolate_na(dim="time", method="linear")
+        
+        # compute snow cover duration (SCD)
+        scd = snowMap_stack_interp.mean(dim='time')
+
+    
+    # VIIRS
+    elif os.path.basename(snowMap_fileNameList[0]).startswith('VNP10A1F'):   
+        # keep only snow and no snow values (0-100)
+        # snowT = 30
+        # snowMap_stack_fltd = xr.where((snowMap_stack_filled >= snowT) & (snowMap_stack_filled <= 100), 1, 
+        #                       xr.where((snowMap_stack_filled >= 0) & (snowMap_stack_filled < snowT), 0, np.nan))
+        
+        snowMap_stack_fltd = xr.where((snowMap_stack_filled >= 0) & (snowMap_stack_filled <= 100), 
+                                      snowMap_stack_filled, np.nan)
+        
+        # interpolate over time
+        snowMap_stack_interp = snowMap_stack_fltd.interpolate_na(dim="time", method="linear")
+        
+        # compute snow cover duration (SCD)
+        scd = snowMap_stack_interp.mean(dim='time')/100
+
+
+    else: 
+        raise ValueError("Product not recognized") 
+               
+    return scd 
 
 
 
-    for i,date in enumerate(masked_data.time):
-        
-        # condizione 1 il gap deve essere inferiore o uguale a 5 giorni
-        delta = np.array(data_bfill.sel(time=date)) - np.array(data_ffill.sel(time=date)) 
-        mask_delta = delta <= 30
-        
-        # il forward fill e backward fill devono essere uguali
-        mask_mt = np.array(data_bfill.sel(time=date)) == np.array(data_ffill.sel(time=date))
-        mask_nan = np.array(~mask.sel(time=date))
-        
-        # deve essere nan
-        mask_new = np.logical_and.reduce((mask_mt,mask_nan))
- 
-        
-        data_array.sel(time=date).values = np.array(data_bfill.sel(time=date))[mask_new] 
-        
+def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30, 
+                       shp_fileName=None, window=2, mode="yearly"):
+    """
+    Computes Snow Cover Duration (SCD) statistics for either full seasons (yearly) or individual months.
 
+    Parameters:
+    -----------
+    snowMap_fileNameList : list of str
+        List of file paths for snow cover maps.
+    max_missing_days : int, optional
+        Maximum allowed missing days in a time period (default is 30).
+    shp_fileName : str, optional
+        Path to a shapefile for masking the data (default is None).
+    window : int, optional
+        Time window (in days) for extending the start and end dates (default is 2).
+    mode : str, optional
+        - `"yearly"` (default) → Compute SCD for full snow seasons (1st Oct – 30th Sept).
+        - `"monthly"` → Compute SCD for each individual month.
+
+    Returns:
+    --------
+    dict
+        Dictionary where keys are either **seasons (e.g., "2020-2021")** or **months ("YYYY-MM")** 
+        and values are SCD datasets.
+    """
     
+    # Extract dates from filenames
+    dates = sorted([dateFromFileName(f) for f in snowMap_fileNameList])
+    
+    results = {}
+
+    # --- Yearly (Seasonal) Processing ---
+    if mode == "yearly":
+        for year in range(dates[0].year, dates[-1].year):  
+            date_start = pd.Timestamp(year=year, month=10, day=1).date()  # 1st October
+            date_end = pd.Timestamp(year=year + 1, month=9, day=30).date()  # 30th September
+            
+            # Filter files for this season
+            season_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
+            
+            # Check missing days
+            full_time_range = pd.date_range(start=date_start, end=date_end, freq="D")
+            available_dates = set(dateFromFileName(f) for f in season_files)
+            missing_days = len(full_time_range) - len(available_dates)
+            
+            if missing_days <= max_missing_days:  
+                print(f"Processing season {year}-{year+1} (missing days: {missing_days})")
+                results[f"{year}-{year+1}"] = get_scd(season_files, date_start.strftime('%d-%m-%Y'), 
+                                                      date_end.strftime('%d-%m-%Y'), shp_fileName, window)
+            else:
+                print(f"Skipping season {year}-{year+1} (too many missing days: {missing_days})")
+    
+    # --- Monthly Processing ---
+    elif mode == "monthly":
+        for date in pd.date_range(start=dates[0], end=dates[-1], freq="MS"):  # MS = Month Start
+            date_start = pd.Timestamp(year=date.year, month=date.month, day=1).date()
+            date_end = pd.Timestamp(year=date.year, month=date.month, 
+                                    day=pd.Period(date, freq='D').days_in_month).date()
+            
+            # Filter files for this month
+            month_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
+            
+            # Check missing days
+            full_time_range = pd.date_range(start=date_start, end=date_end, freq="D")
+            available_dates = set(dateFromFileName(f) for f in month_files)
+            missing_days = len(full_time_range) - len(available_dates)
+            
+            if missing_days <= max_missing_days:  
+                print(f"Processing month {date.strftime('%Y-%m')} (missing days: {missing_days})")
+                results[f"{date.strftime('%Y-%m')}"] = get_scd(month_files, date_start.strftime('%d-%m-%Y'), 
+                                                               date_end.strftime('%d-%m-%Y'), shp_fileName, window)
+            else:
+                print(f"Skipping month {date.strftime('%Y-%m')} (too many missing days: {missing_days})")
+    
+    else:
+        raise ValueError("Invalid mode! Use 'yearly' or 'monthly'.")
+
+    return results
 
 
         
