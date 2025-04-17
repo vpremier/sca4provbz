@@ -241,9 +241,11 @@ def get_scf_viirs(fileList, outdir, res=500, img4ext=None, extent_target=None,
         
         # Read VIIRS dataset
         viirs_ds = read_vnp10a1f(filename)
-        
+
         # Reproject NDSI Snow Cover
-        ndsi = viirs_ds['CGF_NDSI_Snow_Cover'].rio.reproject(epsg, resampling=Resampling.bilinear) / 100
+        ndsi = viirs_ds['CGF_NDSI_Snow_Cover'].where(viirs_ds['CGF_NDSI_Snow_Cover']<=100).rio.reproject(epsg, resampling=Resampling.bilinear) / 100
+        # ndsi = viirs_ds['CGF_NDSI_Snow_Cover'].rio.reproject(epsg, resampling=Resampling.bilinear) / 100
+
         
         # Reproject cloud mask
         cloud = viirs_ds['CGF_NDSI_Snow_Cover'].rio.reproject(epsg, resampling=Resampling.nearest)
@@ -258,9 +260,10 @@ def get_scf_viirs(fileList, outdir, res=500, img4ext=None, extent_target=None,
 
         # Compute Snow Cover Fraction (SCF)
         scf = (-0.01 + 1.45 * ndsi_rsmp) * 100
-        scf = scf.where(scf < 100, other=100).where(scf > 0, other=0)
+        scf = scf.where((scf< 100) | (np.isnan(scf)), other=100).where((scf > 0) | (np.isnan(scf)), other=0)
         scf = scf.where(cloud_rsmp <= 100, other=205)
-
+        scf = scf.fillna(205)
+        
         # Save output as GeoTIFF
         scf.rio.to_raster(fileName_output)
 
