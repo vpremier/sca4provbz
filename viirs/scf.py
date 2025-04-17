@@ -231,7 +231,8 @@ def get_scf_viirs(fileList, outdir, res=500, img4ext=None, extent_target=None,
         # Generate output filename
         date = os.path.basename(filename).split('.')[1][1:] 
         new_date = dt.strptime(date, '%Y%j').strftime('%Y%m%d')
-        fileName_output = os.path.join(outdir, f'VNP10A1F_{new_date}.tif')
+        fileName_output = os.path.join(outdir, f'EURAC_SNOW_MERGE.alps.south-tyrol.{new_date}T120000.vnp10a1f.tif')
+        # fileName_output = os.path.join(outdir, f'VNP10A1F_{new_date}.tif')
 
         # Skip existing files if overwrite is False
         if os.path.exists(fileName_output) and not ow:

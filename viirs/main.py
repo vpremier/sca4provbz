@@ -75,7 +75,7 @@ results = earthaccess.search_data(
 files = earthaccess.download(results, download_dir)
 
 
-aaa
+
 # list of downloaded files
 fileList = glob.glob(download_dir + os.sep + 'VNP10A1F.A20*.h5')
 
@@ -85,11 +85,11 @@ outdir = r'/mnt/CEPH_PROJECTS/PROSNOW/4.results/VNP10A1F_SouthTyrol'
 epsg_target = '32632'
 
 # get bounding box
-shapefile = gpd.read_file(shp)
-shp_rpj = shapefile.to_crs(crs=epsg_target)
-bbox = list(shp_rpj.bounds.iloc[0])
+# shapefile = gpd.read_file(shp)
+# shp_rpj = shapefile.to_crs(crs=epsg_target)
+# bbox = list(shp_rpj.bounds.iloc[0])
 
-# keep an extent that is similar to the previous extent of the EURAC SNOW product
+# keep the extent asked by the province
 extent_target = [597972, 5117987, 767972, 5221987]
 
 # create the SCF maps
