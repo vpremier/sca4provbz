@@ -19,7 +19,8 @@ import re
 import datetime
 from datetime import datetime as dt
 import matplotlib.pyplot as plt
-import progressbar
+from collections import defaultdict
+import pymannkendall as mk
 
 
 
@@ -89,8 +90,7 @@ def get_sca_metrics(array, snow, nosnow, cloud, nodata):
     """
     
     # Compute pixel counts
-    cloudPixels = np.sum(array == cloud)
-    nodataPixels = np.sum(array == nodata)
+    cloudPixels = np.sum(array == cloud) + np.sum(array == nodata)
 
     if type(snow) is list:
         validPixels = np.sum(array <= snow[1]) 
@@ -106,7 +106,7 @@ def get_sca_metrics(array, snow, nosnow, cloud, nodata):
 
 
     # Compute total number of pixels
-    N = float(snowPixels + cloudPixels + nosnowPixels + nodataPixels)
+    N = float(snowPixels + cloudPixels + nosnowPixels)
     if N == 0:
         raise ValueError("The input array contains no valid pixels for computation.")
 
@@ -130,9 +130,9 @@ def get_sca_metrics(array, snow, nosnow, cloud, nodata):
 
 
 
-def apply_mask(snowMap, shp_fileName=None):
+def apply_mask(snowMap, shp_fileName=None, mask_raster_fileName=None):
     """
-    Applies a mask to a raster dataset using a shapefile. 
+    Applies a mask to a raster dataset using a shapefile and/or another raster mask.
     Masked values are set to 255.
 
     Parameters:
@@ -140,14 +140,17 @@ def apply_mask(snowMap, shp_fileName=None):
     snowMap : str
         Path to the raster file (GeoTIFF).
     shp_fileName : str, optional
-        Path to the shapefile used for masking (default is None).
+        Path to the shapefile for masking.
+    mask_raster_fileName : str, optional
+        Path to a raster file used as an additional mask.
 
     Returns:
     --------
     xarray.DataArray
-        Masked raster dataset clipped to the shapefile extent.
-
+        Masked raster dataset.
     """
+   
+
     # Open the raster to get CRS
     img = gdal.Open(snowMap)
     if img is None:
@@ -155,34 +158,55 @@ def apply_mask(snowMap, shp_fileName=None):
 
     prj_img = img.GetProjection()
     crs_img = osr.SpatialReference(wkt=prj_img)
-    img = None  # Close file to free memory
+    img = None  # Close GDAL dataset
 
-    # Open the raster using rioxarray
+    # Open the raster with rioxarray
     ds = rioxarray.open_rasterio(snowMap)
 
-    # Open and process the shapefile if provided
+    # Ensure nodata is defined
+    ds = ds.rio.write_nodata(255)
+
+    # --- Apply vector mask ---
     if shp_fileName is not None:
         shp = gpd.read_file(shp_fileName)
 
         if shp.empty:
             raise ValueError(f"Shapefile {shp_fileName} is empty.")
 
-        # Convert to the same CRS as the raster
+        # Reproject shapefile to raster CRS
         shp_rpj = shp.to_crs(crs=crs_img.ExportToProj4())
 
-        # Merge multiple polygons into one if there are multiple layers or features
+        # Merge all geometries
         merged_geometry = unary_union(shp_rpj["geometry"])
 
-        # Clip the raster using the merged polygon
-        ds = ds.rio.write_nodata(255)
+        # Clip by shapefile geometry
         ds = ds.rio.clip([mapping(merged_geometry)], shp_rpj.crs, drop=True)
+        ds = ds.rio.write_crs(prj_img, inplace=True)
 
-        
+    # --- Apply raster mask ---
+    if mask_raster_fileName is not None:
+        mask_ds = rioxarray.open_rasterio(mask_raster_fileName)
+
+        # Resample mask raster to match the main raster shape/resolution if needed
+        if ds.shape[1:] != mask_ds.shape[1:]:
+            mask_ds = mask_ds.rio.reproject_match(ds)
+
+        # Build mask: here we assume mask=0 means keep, mask>0 means mask out.
+        # Adapt this logic to your mask raster values!
+        mask_array = mask_ds.sel(band=1).values
+
+        # Apply mask to main raster: where mask is 1 (or >0), set raster to nodata (255)
+        ds_array = ds.sel(band=1).values
+        ds_array[mask_array== 0] = 255
+
+        # Replace the band values with the masked array
+        ds[0] = ds_array
+
     return ds
 
 
-
-def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None):
+                
+def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fileName=None):
     """
     This function updates or creates a CSV with new data based on files in a given folder.
 
@@ -196,6 +220,8 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None):
         Path to the working folder for intermediate results.
     shp_fileName : str, optional
         Path to the shapefile, if needed for spatial processing.
+    mask_raster_fileName : str, optional
+        Path to a raster file to use as an additional mask.
     """
     
     # Initialize the DataFrame and date range
@@ -230,14 +256,17 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None):
         
         try:
             # Apply mask to the snow map using the shapefile
-            ds = apply_mask(snowMap, shp_fileName=shp_fileName)
+            ds = apply_mask(snowMap, shp_fileName=shp_fileName, mask_raster_fileName=mask_raster_fileName)
             array = ds.sel(band=1).values  # Assuming the first band is of interest
             
             # Get the metrics from the array
-            if os.path.basename(snowMap).startswith('VNP10A1F'):
-                # 'snow': 0-100, nosnow': 0, 'cloud': 205, 'nodata': 255
-                d = get_sca_metrics(array, [0,100], 0, 205, 255)
-            elif os.path.basename(snowMap).startswith('EURAC_SNOW'):
+            if 'vnp10a1f' in os.path.basename(snowMap):
+                # 'snow': 0-100, nosnow': 0, 'cloud': 205, 'nodata': 205
+                d = get_sca_metrics(array, [0,100], 0, 205, 205)
+            elif 'modis' in os.path.basename(snowMap):
+                # 'snow': 1, nosnow': 2, 'cloud': 3, 'nodata': 0
+                d = get_sca_metrics(array, 1, 2, 3, 0)
+            elif 'complete' in os.path.basename(snowMap).lower():
                 # 'snow': 1, nosnow': 2, 'cloud': 3, 'nodata': 0
                 d = get_sca_metrics(array, 1, 2, 3, 0)
             else: 
@@ -274,7 +303,12 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None):
     
     
 
-def snow_bullettin(pathToCSV, date_start, date_end, work_folder, CCA_threshold=30):
+def snow_bullettin(pathToCSV, 
+                   date_start, 
+                   date_end, 
+                   work_folder, 
+                   suffix, 
+                   CCA_threshold=30):
     """
     Plots the daily Snow Cover Area (SCA) based on a given dataset, filtering out 
     days with excessive cloud coverage. The function also computes historical mean, 
@@ -290,9 +324,11 @@ def snow_bullettin(pathToCSV, date_start, date_end, work_folder, CCA_threshold=3
         End date for analysis in 'YYYY-MM-DD' format.
     work_folder : str
         Directory where the plot will be saved.
+    suffix : str
+        Suffix for the image path.
     CCA_threshold : int, optional
         Maximum allowed cloud percentage for a day to be considered valid (default is 30%).
-
+        
     Returns:
     --------
     newdf : pandas.DataFrame
@@ -334,46 +370,102 @@ def snow_bullettin(pathToCSV, date_start, date_end, work_folder, CCA_threshold=3
     
     # Compute historical statistics (excluding the observation period)
     historical_data = df[df.index < date_start]  # Exclude current period
+    
+    # Remove Feb 29 from historical data
+    historical_data = historical_data[~((historical_data['month'] == 2) & (historical_data['day'] == 29))]
+
+
     # daily_stats = historical_data.groupby(['month', 'day'])['correctedSCA'].agg(['mean', 'min', 'max'])
     daily_stats = historical_data.groupby(['month', 'day'])['correctedSCA'].agg(
-    mean='mean',
-    min=lambda x: np.percentile(x.dropna(), 10),
-    max=lambda x: np.percentile(x.dropna(), 90)
-    )
+                        mean='mean',
+                        min='min',
+                        max='max',
+                        perc5=lambda x: np.percentile(x.dropna(), 5),
+                        perc25=lambda x: np.percentile(x.dropna(), 25),
+                        perc50=lambda x: np.percentile(x.dropna(), 50),
+                        perc75=lambda x: np.percentile(x.dropna(), 75),
+                        perc95=lambda x: np.percentile(x.dropna(), 95)
+                        )
 
-    # Reorder index to start from October 1st
-    year_start = datetime.date(int(date_start[:4]), 1, 1)
-    index_shift = (year_start - date_start_dt.date()).days + 365
-    daily_stats.index = list(range(index_shift, 367)) + list(range(1, index_shift))
+
+    # Convert (month, day) to datetime using a dummy non-leap year for consistency  
+    dummy_year = int(date_start.split('-')[0])
+    new_index = []
     
-    # Remove Feb 29 if exists
-    daily_stats = daily_stats[~((daily_stats.index == 60) & (~df.index.is_leap_year.any()))]
+    for month, day in daily_stats.index:
+        year = dummy_year if month >= 10 else dummy_year + 1
+        try:
+            new_index.append(pd.Timestamp(year=year, month=month, day=day))
+        except ValueError:
+            # Skip invalid dates like Feb 29 if it slipped through
+            continue
+    
+    daily_stats.index = pd.DatetimeIndex(new_index)
+
+
+    # Filter from October 1 to date_end
+    oct_start = pd.to_datetime(f"{dummy_year}-10-01")
+    end_dt = pd.to_datetime(date_end)
+    
+    # If end date is earlier in the year (e.g. April), it means it belongs to the *next* calendar year in water year logic
+    if end_dt.month < 10:
+        end_dt = end_dt.replace(year=dummy_year + 1)
+    else:
+        end_dt = end_dt.replace(year=dummy_year)
+    
+    # Keep only the range October 1 to desired end date
+    daily_stats = daily_stats[(daily_stats.index >= oct_start) & (daily_stats.index <= end_dt)]
+
     daily_stats.sort_index(inplace=True)
+
     
+    # Remove Feb 29 from observation period if present
+    sca = sca[~((sca.index.month == 2) & (sca.index.day == 29))]
+
     # Create DataFrame for plotting
     newdf = pd.DataFrame(index=sca.index)
     newdf['current SCA'] = sca.values
+    newdf['mean SCA'] = daily_stats['mean'].iloc[:nr_days+1].values
     newdf['min SCA'] = daily_stats['min'].iloc[:nr_days+1].values
     newdf['max SCA'] = daily_stats['max'].iloc[:nr_days+1].values
-    newdf['mean SCA'] = daily_stats['mean'].iloc[:nr_days+1].values
+
+    newdf['perc5 SCA'] = daily_stats['perc5'].iloc[:nr_days+1].values
+    newdf['perc25 SCA'] = daily_stats['perc25'].iloc[:nr_days+1].values
+    newdf['perc50 SCA'] = daily_stats['perc50'].iloc[:nr_days+1].values
+    newdf['perc75 SCA'] = daily_stats['perc75'].iloc[:nr_days+1].values
+    newdf['perc95 SCA'] = daily_stats['perc95'].iloc[:nr_days+1].values
     
     newdf.sort_index(inplace=True)
 
 
     # Plot
     plt.figure(figsize=(10, 5))
-    plt.plot(sca.index, sca, label='Current SCA')
-    plt.plot(sca.index, newdf['mean SCA'], label='Mean SCA', linestyle='dashed')
-    plt.fill_between(sca.index, newdf['min SCA'], newdf['max SCA'], color='b', alpha=0.2)
+    plt.fill_between(sca.index, newdf['perc25 SCA'], newdf['perc75 SCA'], 
+                     color='gray', alpha=0.2, label='25-75% range')
+
+
+    # Fill lower tail: 5th to 25th percentile
+    plt.fill_between(sca.index, newdf['perc5 SCA'], newdf['perc25 SCA'],
+                     color='orangered', alpha=0.2, label='5-95% range')
+    
+    # Fill upper tail: 75th to 95th percentile
+    plt.fill_between(sca.index, newdf['perc75 SCA'], newdf['perc95 SCA'],
+                     color='orangered', alpha=0.2)
+
+    plt.plot(sca.index, newdf['perc50 SCA'], label='50th percentile', color='gray', linestyle='-')
+    plt.plot(sca.index, sca, color='orangered', linewidth=2, label='Current SCA')
+
+    # plt.plot(sca.index, newdf['mean SCA'], label='Mean SCA', linestyle='dashed')
+
     plt.ylim([0, 100])
     plt.xticks(rotation=30)
-    plt.ylabel('% SCA')
+    plt.ylabel('SCA [%]')
     plt.legend()
     plt.grid()
     
     # Save plot
-    plt.savefig(os.path.join(work_folder, f"snow_bulletin_{date_start}_{date_end}.png"), bbox_inches="tight")
-    
+    plt.savefig(os.path.join(work_folder, f"snow_bulletin_{date_start}_{date_end}_{suffix}.png"), bbox_inches="tight")
+
     return newdf
 
 
@@ -441,7 +533,7 @@ def multitemporal_filter(data_array, window=2):
     - xarray.DataArray: Filtered DataArray with NaNs where conditions are met.
     """
     # Define values to mask
-    mask_values = [0, 3, 5, 255]
+    mask_values = [0, 3, 5, 205, 255]
     
     # Create mask
     mask = ~data_array.isin(mask_values)
@@ -517,7 +609,8 @@ def get_scd(snowMap_fileNameList, date_start, date_end, shp_fileName=None, windo
                                                  fill_value=255)
     
     # MODIS
-    if os.path.basename(snowMap_fileNameList[0]).startswith('EURAC_SNOW'):   
+    bn = os.path.basename(snowMap_fileNameList[0])
+    if 'modis' in bn or "complete" in bn:   
         # apply multi-temporal filter
         snowMap_stack_fltd = multitemporal_filter(snowMap_stack_filled, window=window)
     
@@ -534,7 +627,7 @@ def get_scd(snowMap_fileNameList, date_start, date_end, shp_fileName=None, windo
 
     
     # VIIRS
-    elif os.path.basename(snowMap_fileNameList[0]).startswith('VNP10A1F'):   
+    elif 'vnp10a1f' in bn:   
         # keep only snow and no snow values (0-100)
         # snowT = 30
         # snowMap_stack_fltd = xr.where((snowMap_stack_filled >= snowT) & (snowMap_stack_filled <= 100), 1, 
@@ -558,7 +651,8 @@ def get_scd(snowMap_fileNameList, date_start, date_end, shp_fileName=None, windo
 
 
 def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30, 
-                       shp_fileName=None, window=2, mode="yearly"):
+                       shp_fileName=None, window=2, mode="yearly", 
+                       save=True, ow=False):
     """
     Computes Snow Cover Duration (SCD) statistics for either full seasons (yearly) or individual months.
 
@@ -575,6 +669,10 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
     mode : str, optional
         - `"yearly"` (default) → Compute SCD for full snow seasons (1st Oct – 30th Sept).
         - `"monthly"` → Compute SCD for each individual month.
+    save: bool, optional
+        Whether to save as GeoTIFF or not the snow cover duration maps.
+    ow: bool, optional
+        Whether to overwrite or not the output GeoTiff maps.
 
     Returns:
     --------
@@ -583,53 +681,101 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
         and values are SCD datasets.
     """
     
+    today = dt.today()
+    
     # Extract dates from filenames
     dates = sorted([dateFromFileName(f) for f in snowMap_fileNameList])
     
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
+        
+    # Open the raster to get CRS
+    img = gdal.Open(snowMap_fileNameList[0])
+    if img is None:
+        raise ValueError(f"Could not open raster file: {snowMap_fileNameList[0]}")
+
+    prj_img = img.GetProjection()
+    img = None  # Close file to free memory
+        
     results = {}
 
     # --- Yearly (Seasonal) Processing ---
     if mode == "yearly":
         for year in range(dates[0].year, dates[-1].year):  
+            
+            if year == today.year-1:
+                print("Skipping current year")
+                continue
+            
             date_start = pd.Timestamp(year=year, month=10, day=1).date()  # 1st October
             date_end = pd.Timestamp(year=year + 1, month=9, day=30).date()  # 30th September
             
-            # Filter files for this season
-            season_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
+            outname = os.path.join(outdir, f'scd_{year}_{year+1}.tif')
             
-            # Check missing days
-            full_time_range = pd.date_range(start=date_start, end=date_end, freq="D")
-            available_dates = set(dateFromFileName(f) for f in season_files)
-            missing_days = len(full_time_range) - len(available_dates)
+            if not os.path.exists(outname) or ow:
+                
+                # Filter files for this season
+                season_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
+                
+                # Check missing days
+                full_time_range = pd.date_range(start=date_start, end=date_end, freq="D")
+                available_dates = set(dateFromFileName(f) for f in season_files)
+                missing_days = len(full_time_range) - len(available_dates)
+                
+                if missing_days <= max_missing_days:  
+                    print(f"Processing season {year}-{year+1} (missing days: {missing_days})")
+                    results[f"{year}-{year+1}"] = get_scd(season_files, date_start.strftime('%d-%m-%Y'), 
+                                                          date_end.strftime('%d-%m-%Y'), shp_fileName, window)
+                    
+                    if save:
+                        results[f"{year}-{year+1}"] = results[f"{year}-{year+1}"].rio.write_crs(prj_img, inplace=True)
+                        results[f"{year}-{year+1}"].rio.to_raster(outname)
+                else:
+                    print(f"Skipping season {year}-{year+1} (too many missing days: {missing_days})")
             
-            if missing_days <= max_missing_days:  
-                print(f"Processing season {year}-{year+1} (missing days: {missing_days})")
-                results[f"{year}-{year+1}"] = get_scd(season_files, date_start.strftime('%d-%m-%Y'), 
-                                                      date_end.strftime('%d-%m-%Y'), shp_fileName, window)
             else:
-                print(f"Skipping season {year}-{year+1} (too many missing days: {missing_days})")
+                results[f"{year}-{year+1}"] = xr.open_dataset(outname)['band_data']
+                
     
     # --- Monthly Processing ---
     elif mode == "monthly":
         for date in pd.date_range(start=dates[0], end=dates[-1], freq="MS"):  # MS = Month Start
+        
+            if date.year == today.year and date.month == today.month:
+                print("Skipping current month")
+                continue
+        
             date_start = pd.Timestamp(year=date.year, month=date.month, day=1).date()
             date_end = pd.Timestamp(year=date.year, month=date.month, 
                                     day=pd.Period(date, freq='D').days_in_month).date()
             
-            # Filter files for this month
-            month_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
+            outname = os.path.join(outdir, f"{date.strftime('%Y-%m')}.tif")
             
-            # Check missing days
-            full_time_range = pd.date_range(start=date_start, end=date_end, freq="D")
-            available_dates = set(dateFromFileName(f) for f in month_files)
-            missing_days = len(full_time_range) - len(available_dates)
-            
-            if missing_days <= max_missing_days:  
-                print(f"Processing month {date.strftime('%Y-%m')} (missing days: {missing_days})")
-                results[f"{date.strftime('%Y-%m')}"] = get_scd(month_files, date_start.strftime('%d-%m-%Y'), 
-                                                               date_end.strftime('%d-%m-%Y'), shp_fileName, window)
+            if not os.path.exists(outname) or ow:
+    
+    
+                # Filter files for this month
+                month_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
+                
+                # Check missing days
+                full_time_range = pd.date_range(start=date_start, end=date_end, freq="D")
+                available_dates = set(dateFromFileName(f) for f in month_files)
+                missing_days = len(full_time_range) - len(available_dates)
+                
+                if missing_days <= max_missing_days:  
+                    print(f"Processing month {date.strftime('%Y-%m')} (missing days: {missing_days})")
+                    results[f"{date.strftime('%Y-%m')}"] = get_scd(month_files, date_start.strftime('%d-%m-%Y'), 
+                                                                   date_end.strftime('%d-%m-%Y'), shp_fileName, window)
+                    
+                    if save:
+                        results[f"{date.strftime('%Y-%m')}"] = results[f"{date.strftime('%Y-%m')}"].rio.write_crs(prj_img, inplace=True)
+                        results[f"{date.strftime('%Y-%m')}"].rio.to_raster(outname)
+                        
+                else:
+                    print(f"Skipping month {date.strftime('%Y-%m')} (too many missing days: {missing_days})")
+                    
             else:
-                print(f"Skipping month {date.strftime('%Y-%m')} (too many missing days: {missing_days})")
+                results[f"{date.strftime('%Y-%m')}"] = xr.open_dataset(outname)['band_data']
     
     else:
         raise ValueError("Invalid mode! Use 'yearly' or 'monthly'.")
@@ -637,4 +783,131 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
     return results
 
 
+
+def compute_scd_anomaly(results, target_year):
+    # Extract the target map
+    target_scd = results[target_year]
+    
+    # Compute the mean of all other years
+    other_years = [year for year in results if year != target_year]
+    all_others = xr.concat([results[year] for year in other_years], dim='year')
+    mean_scd = all_others.mean(dim='year')
+    
+    # Compute anomaly
+    anomaly = target_scd - mean_scd
+    
+    plt.figure()
+    plt.imshow(np.squeeze(anomaly.values), vmin=-1, vmax=1)
+    plt.colorbar()
+    return anomaly
+
+
+
+def monthly_anomaly_scd(results, outdir):
+    # Organize maps by month (e.g., "10" → [Oct_2021, Oct_2022, ...])
+    monthly_data = defaultdict(list)
+    for key, da in results.items():
+        year_month = pd.to_datetime(key)
+        month_str = f"{year_month.month:02d}"
+        monthly_data[month_str].append((year_month.year, da))
+    
+    monthly_anomalies = {}
+    
+    # Assuming you want anomalies for the latest year in each month group
+    for month_str, values in monthly_data.items():
+        # Sort by year
+        values = sorted(values, key=lambda x: x[0])
         
+        # Separate latest from historical
+        *historical, latest = values
+        historical_maps = xr.concat([da for _, da in historical], dim="year")
+        mean_map = historical_maps.mean(dim="year")
+        
+        latest_year, latest_map = latest
+        anomaly = latest_map - mean_map
+        monthly_anomalies[month_str] = (f"{latest_year}-{month_str}", anomaly)
+    
+    
+    # Sort by actual datetime for proper chronological order
+    ordered_items = sorted(monthly_anomalies.items(), key=lambda kv: pd.to_datetime(kv[1][0]))
+    
+    fig, axes = plt.subplots(nrows=3, ncols=4, figsize=(16, 10))
+    axes = axes.flatten()
+    
+    for i, (month_str, (label, da)) in enumerate(ordered_items):
+        da.plot(ax=axes[i], cmap="RdBu", vmin=-1, vmax=1, center=0, cbar_kwargs={'label': 'SCD Anomaly (days)'})
+        axes[i].set_title(pd.to_datetime(label).strftime("%B %Y"))
+    
+    # Hide any unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis("off")
+    
+    plt.suptitle("Monthly Snow Cover Duration Anomalies", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(os.path.join(outdir, 'SCD_anomalies.png'))
+    
+    
+
+def calculate_trends(csv_name):
+    """
+    Calculate seasonal and hydrological year snow cover area (SCA) trends
+    and the Mann-Kendall trend test.
+
+
+    Parameters
+    ----------
+    csv_name : str
+        Path to the CSV file containing daily SCA data. The CSV must have a date column 
+        as index (or in column `Unnamed: 0`) and a column named 'SCA'.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns:
+            - 'Nov-Dec' : mean SCA for November–December
+            - 'Jan-Feb' : mean SCA for January–February (shifted to previous year)
+            - 'Mar-Apr' : mean SCA for March–April (shifted to previous year)
+            - 'Mean(Nov-Apr)' : mean SCA for the full hydrological year
+
+        The index shows hydrological years in `YYYY/YYYY` format.
+    """
+    # Load and prepare
+    df = pd.read_csv(csv_name)
+    df.index = pd.to_datetime(df['Unnamed: 0'], format='%Y-%m-%d')
+    df.drop(columns=['Unnamed: 0'], inplace=True)
+    
+    # Seasonal means
+    df_novdec = df[df.index.month.isin([11, 12])].copy()
+    df_novdec['year'] = df_novdec.index.year
+    df_novdec_mean = df_novdec.groupby('year').mean()
+    
+    df_janfeb = df[df.index.month.isin([1, 2])].copy()
+    df_janfeb['year'] = df_janfeb.index.year
+    df_janfeb_mean = df_janfeb.groupby('year').mean()
+    
+    df_marapr = df[df.index.month.isin([3, 4])].copy()
+    df_marapr['year'] = df_marapr.index.year
+    df_marapr_mean = df_marapr.groupby('year').mean()
+    
+    # Shift indices
+    df_janfeb_mean['SCA'].index = df_janfeb_mean['SCA'].index - 1
+    df_marapr_mean['SCA'].index = df_marapr_mean['SCA'].index - 1
+
+    # Combine to final DataFrame
+    newdf = pd.DataFrame({
+        'Nov-Dec': df_novdec_mean['SCA'],
+        'Jan-Feb': df_janfeb_mean['SCA'],
+        'Mar-Apr': df_marapr_mean['SCA']
+    })
+
+    # Add hydrological mean
+    newdf['Mean(Nov-Apr)'] = newdf[['Nov-Dec', 'Jan-Feb', 'Mar-Apr']].mean(axis=1)
+
+    # Add hydrological year label YYYY/YYYY
+    newdf.index = [f"{y}/{y+1}" for y in newdf.index]
+
+    # Trend test
+    mk.original_test(newdf['Mean(Nov-Apr)'].dropna())
+
+    return newdf
+

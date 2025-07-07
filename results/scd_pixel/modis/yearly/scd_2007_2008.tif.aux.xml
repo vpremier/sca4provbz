@@ -1,0 +1,12 @@
+<PAMDataset>
+  <PAMRasterBand band="1">
+    <Description>snow_map</Description>
+    <Metadata>
+      <MDI key="STATISTICS_MAXIMUM">1</MDI>
+      <MDI key="STATISTICS_MEAN">0.9931693989071</MDI>
+      <MDI key="STATISTICS_MINIMUM">0.97814207650273</MDI>
+      <MDI key="STATISTICS_STDDEV">0.0053784206789698</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">80</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>

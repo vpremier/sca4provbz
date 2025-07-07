@@ -35,7 +35,7 @@ auth = earthaccess.login(strategy='netrc')
 # set your credentials: https://earthaccess.readthedocs.io/en/latest/howto/authenticate/
 
 # shapefile with the AOI
-shp = r'/home/vpremier/Documents/git/sca4provbz/input/ST_shape/SouthTyrol.shp'
+shp = r'/home/vpremier/Documents/git/sca4provbz/shapefile/ST_shape/SouthTyrol.shp'
 
 #read the shapefile
 gdf = gpd.read_file(shp)

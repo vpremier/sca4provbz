@@ -15,24 +15,32 @@ from datetime import datetime as dt
 from utils import *
 
 # shape with the area of interest
-shp_fileName = r'/home/vpremier/Documents/git/sca4provbz/input/ST_shape/SouthTyrol.shp'
+shp_fileName = r'/home/vpremier/Documents/git/sca4provbz/shapefile/ST_shape/SouthTyrol.shp'
+# shp_fileName = r'/mnt/CEPH_PROJECTS/PROSNOW/sorgente_oltre_confine_buffer_500m/sorgente_oltre_confine_buffer_500m.shp'
 
-satellite = 'MODIS'
+# rilanciare forse per il problema no data??
 
-if satellite == 'MODIS':
+suffix = 'modis'
+
+if suffix == 'modis':
     # for EURAC SNOW dataset
-    csv_path = r'/home/vpremier/Documents/git/sca4provbz/input/ST_shape_alps.csv'
-    pathToDataFolder = r'/mnt/CEPH_PRODUCTS/EURAC_SNOW/MODIS/ST'
-    snowMap_fileNameList = glob.glob(pathToDataFolder + os.sep + '*/EURAC_SNOW*.tif')
+    csv_path = r'/home/vpremier/Documents/git/sca4provbz/results/snow_bullettin/ST_modis.csv'
+    # pathToDataFolder = r'/mnt/CEPH_PRODUCTS/EURAC_SNOW/MODIS/ST/*'
+    # csv_path = r'/home/vpremier/Documents/git/sca4provbz/results/snow_bullettin/TAA_modis.csv'
+    pathToDataFolder = r'/mnt/CEPH_PRODUCTS/EURAC_SNOW/MODIS/alps/*'
+    
 
-elif satellite == 'VIIRS':
+elif suffix == 'vnp10a1f':
     # for VNP10A1F dataset
-    csv_path = r'/home/vpremier/Documents/git/sca4provbz/input/ST_viirs_shape.csv'
-    pathToDataFolder = r'/mnt/CEPH_PROJECTS/PROSNOW/4.results/VNP10A1F_SouthTyrol'
-    snowMap_fileNameList = glob.glob(pathToDataFolder + os.sep + 'VNP10A1F*.tif')
+    csv_path = r'/home/vpremier/Documents/git/sca4provbz/results/snow_bullettin/ST_viirs.csv'
+    # pathToDataFolder = r'/mnt/CEPH_PROJECTS/PROSNOW/4.results/VNP10A1F_SouthTyrol'
+    # csv_path = r'/home/vpremier/Documents/git/sca4provbz/results/snow_bullettin/TAA_viirs.csv'
+    pathToDataFolder = r'/mnt/CEPH_PROJECTS/PROSNOW/4.results/VNP10A1F_TAA'
+
+snowMap_fileNameList = glob.glob(pathToDataFolder + os.sep + 'EURAC_SNOW*.tif')
 
 
-work_folder = os.getcwd()
+outdir = r'/home/vpremier/Documents/git/sca4provbz/results/snow_bullettin'
 
 start_time = time.time()
 
@@ -61,49 +69,32 @@ else:
 date_start = date_start.strftime('%Y-%m-%d')
 date_end = date_end.strftime('%Y-%m-%d')
 
-# date_start = '2023-10-01'
+# date_start = '2024-10-01'
 # date_end = '2024-06-29'
 
 print(f"date_start: {date_start}, date_end: {date_end}")
 
-statistics = snow_bullettin(csv_path, date_start, date_end, work_folder)
+statistics = snow_bullettin(csv_path, date_start, date_end, outdir, suffix)
 
-sorted_files = sorted(snowMap_fileNameList, key=dateFromFileName)
-# Open a text file to save the results
-with open(r"/home/vpremier/Documents/git/sca4provbz/ST_to_reprocess.txt", "a") as outfile:
-    ref = None  # Reference bounds
 
-    for i, f in enumerate(sorted_files):
-        print(f)
-        ds = rioxarray.open_rasterio(f)
-        
-        # Get bounds
-        xmin, ymin, xmax, ymax = ds.rio.bounds()
-        bounds = (xmin, ymin, xmax, ymax)
-        
-        # Set the first file as the reference
-        if i == 0:
-            ref = bounds
-        
-        # If bounds differ, print and write to file
-        if bounds != ref:
-            print(f"{f} has different bounds: {bounds}")
-            outfile.write(f"{f}")
             
             
-sss            
+          
 
 """
 SNOW COVER DURATION (SCD)
 """
-outdir_y = r'/home/vpremier/Documents/git/sca4provbz/scd/VIIRS/yearly'
-outdir_m = r'/home/vpremier/Documents/git/sca4provbz/scd/VIIRS/monthly'
+outdir_y = f'/home/vpremier/Documents/git/sca4provbz/results/scd/{suffix}/yearly'
+outdir_m = f'/home/vpremier/Documents/git/sca4provbz/results/scd/{suffix}/monthly'
 
 
-scd_yearly = get_scd_statistics(snowMap_fileNameList, outdir_y, max_missing_days=30, 
+
+scd_yearly = get_scd_statistics(snowMap_fileNameList, outdir_y, max_missing_days=71, 
                                 shp_fileName=shp_fileName, window=2, mode="yearly")
 
-scd_monthly = get_scd_statistics(snowMap_fileNameList, outdir_m, max_missing_days=2, 
-                                shp_fileName=shp_fileName, window=2, mode="monthly")
+# scd_monthly = get_scd_statistics(snowMap_fileNameList, outdir_m, max_missing_days=15, 
+#                                 shp_fileName=shp_fileName, window=2, mode="monthly")
 
 
+# # SCD anomalies
+# monthly_anomaly_scd(scd_monthly, outdir)
