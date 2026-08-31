@@ -31,7 +31,7 @@ Needed information:
 
 suffix = 'modis'
 
-csv_path = r'/home/vpremier/Documents/git/sca4provbz/results/indicators/ST_box_modis.csv'
+csv_path = r'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/results/indicators/ST_box_modis.csv'
 pathToDataFolder = r'/mnt/CEPH_PRODUCTS/EURAC_SNOW/MODIS/ST/*'
     
 
@@ -39,7 +39,7 @@ pathToDataFolder = r'/mnt/CEPH_PRODUCTS/EURAC_SNOW/MODIS/ST/*'
 snowMap_fileNameList = glob.glob(pathToDataFolder + os.sep + 'EURAC_SNOW*.tif')
 
 
-outdir = r'/home/vpremier/Documents/git/sca4provbz/results/indicators'
+outdir = r'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/results/indicators'
 
 start_time = time.time()
 
@@ -55,15 +55,15 @@ SNOW BULLETTIN: Create daily plot with current SCA, mean SCA, min and max
 """
 
 
-date_start = '2024-10-01'
-date_end = '2025-06-25'
+date_start = '2025-10-01'
+date_end = '2026-07-04'
 
 # Parse years 
 year_start = pd.to_datetime(date_start).year
 year_end = pd.to_datetime(date_end).year
 
 statistics = snow_bullettin(csv_path, date_start, date_end, outdir, suffix)
-stats_name = f'/home/vpremier/Documents/git/sca4provbz/results/indicators/statistics_{year_start}_{year_end}.csv'
+stats_name = f'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/results/indicators/statistics_{year_start}_{year_end}.csv'
 
 statistics[['current SCA', 'min SCA', 'max SCA', 'mean SCA']].to_csv(stats_name)
 
@@ -72,16 +72,16 @@ statistics[['current SCA', 'min SCA', 'max SCA', 'mean SCA']].to_csv(stats_name)
 
 # List of (mask raster path, output CSV path) tuples
 mask_csv_pairs = [
-    (r'/home/vpremier/Documents/git/sca4provbz/shapefile/dem_1000.tif',
+    (r'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/shapefile/dem_1000.tif',
      os.path.join(outdir,'SouthTyrol_1000.csv')),
 
-    (r'/home/vpremier/Documents/git/sca4provbz/shapefile/dem_1000_2000.tif',
+    (r'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/shapefile/dem_1000_2000.tif',
      os.path.join(outdir,'SouthTyrol_1000_2000.csv')),
 
-    (r'/home/vpremier/Documents/git/sca4provbz/shapefile/dem_2000_3000.tif',
+    (r'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/shapefile/dem_2000_3000.tif',
      os.path.join(outdir,'SouthTyrol_2000_3000.csv')),
     
-    (r'/home/vpremier/Documents/git/sca4provbz/shapefile/dem_3000.tif',
+    (r'/mnt/CEPH_PROJECTS/PROSNOW/SCA4provbz/shapefile/dem_3000.tif',
      os.path.join(outdir,'SouthTyrol_3000.csv'))
 ]
 

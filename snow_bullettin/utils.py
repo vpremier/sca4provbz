@@ -777,9 +777,49 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
             else:
                 results[f"{date.strftime('%Y-%m')}"] = xr.open_dataset(outname)['band_data']
     
+    # --- Trimester Processing ---
+    elif mode == "trimester":
+        for date in pd.date_range(start=dates[0], end=dates[-1], freq="QS"):  # quarter starts: Jan, Apr, Jul, Oct
+            today_ts = pd.Timestamp.today().normalize()
+            q_start = pd.Timestamp(date.year, date.month, 1).normalize()
+            q_end = (q_start + pd.offsets.QuarterEnd()).normalize()
+    
+            # Skip only the trimester that includes 'today'
+            if q_start <= today_ts <= q_end:
+                print("Skipping current trimester")
+                continue
+    
+            tnum = ((q_start.month - 1) // 3) + 1
+            outname = os.path.join(outdir, f"{q_start.year}-T{tnum}.tif")
+    
+            if not os.path.exists(outname) or ow:
+                trimester_files = [f for f in snowMap_fileNameList
+                                   if q_start.date() <= dateFromFileName(f) <= q_end.date()]
+    
+                full_time_range = pd.date_range(start=q_start.date(), end=q_end.date(), freq="D")
+                available_dates = set(dateFromFileName(f) for f in trimester_files)
+                missing_days = len(full_time_range) - len(available_dates)
+    
+                if missing_days <= max_missing_days:
+                    print(f"Processing trimester {q_start.year}-T{tnum} (missing days: {missing_days})")
+                    results[f"{q_start.year}-T{tnum}"] = get_scd(
+                        trimester_files, q_start.strftime('%d-%m-%Y'), q_end.strftime('%d-%m-%Y'),
+                        shp_fileName, window
+                    )
+                    if save:
+                        results[f"{q_start.year}-T{tnum}"] = results[f"{q_start.year}-T{tnum}"].rio.write_crs(prj_img, inplace=True)
+                        results[f"{q_start.year}-T{tnum}"].rio.to_raster(outname)
+                else:
+                    print(f"Skipping trimester {q_start.year}-T{tnum} (too many missing days: {missing_days})")
+            else:
+                results[f"{q_start.year}-T{tnum}"] = xr.open_dataset(outname)['band_data']
+    
+    
+    
     else:
-        raise ValueError("Invalid mode! Use 'yearly' or 'monthly'.")
-
+        raise ValueError("Invalid mode! Use 'yearly', 'monthly' or 'trimester'.")
+            
+        
     return results
 
 
@@ -835,8 +875,9 @@ def monthly_anomaly_scd(results, outdir):
     axes = axes.flatten()
     
     for i, (month_str, (label, da)) in enumerate(ordered_items):
-        da.plot(ax=axes[i], cmap="RdBu", vmin=-1, vmax=1, center=0, cbar_kwargs={'label': 'SCD Anomaly (days)'})
+        da.plot(ax=axes[i], cmap="RdBu", vmin=-1, vmax=1, center=0, cbar_kwargs={'label': 'SCD Anomaly'})
         axes[i].set_title(pd.to_datetime(label).strftime("%B %Y"))
+        axes[i].tick_params(axis='x', labelrotation=20)
     
     # Hide any unused axes
     for j in range(i + 1, len(axes)):
@@ -890,8 +931,8 @@ def calculate_trends(csv_name):
     df_marapr_mean = df_marapr.groupby('year').mean()
     
     # Shift indices
-    df_janfeb_mean['SCA'].index = df_janfeb_mean['SCA'].index - 1
-    df_marapr_mean['SCA'].index = df_marapr_mean['SCA'].index - 1
+    df_janfeb_mean.index = df_janfeb_mean.index - 1
+    df_marapr_mean.index = df_marapr_mean.index - 1
 
     # Combine to final DataFrame
     newdf = pd.DataFrame({

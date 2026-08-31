@@ -1,270 +1,390 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Mar  8 10:13:00 2023
+"""Convert VNP10A1F granules into consistently gridded SCF GeoTIFFs."""
 
-@author: vpremier
-"""
+from __future__ import annotations
+
+import logging
 import os
-import sys
-import numpy as np
-from datetime import datetime as dt
-from osgeo import osr, gdal
-import xarray as xr
-import rioxarray
-from affine import Affine
-from rasterio.enums import Resampling
+import re
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Sequence
+
 import h5py
+import numpy as np
+import rasterio
+import rioxarray  # noqa: F401 - registers the xarray ``rio`` accessor
+import xarray as xr
+from affine import Affine
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.warp import reproject
 
 
-
-def open_image(image_path):
-    """
-    Opens a raster image using GDAL and extracts geospatial metadata.
-
-    Parameters:
-    -----------
-    image_path : str
-        The file path to the raster image.
-
-    Returns:
-    --------
-    tuple:
-        - image : gdal.Dataset
-            The opened raster image as a GDAL dataset.
-        - information : dict
-            A dictionary containing geospatial metadata:
-            - 'geotransform' : tuple
-                A six-element tuple describing the affine transformation:
-                (top-left x, pixel width, rotation, top-left y, rotation, pixel height)
-            - 'extent' : list
-                A list defining the spatial extent of the raster: [minx, miny, maxx, maxy]
-            - 'X_Y_raster_size' : list
-                A list with the number of columns (width) and rows (height) of the raster: [cols, rows]
-            - 'projection' : str
-                The projection information in WKT (Well-Known Text) format.
-    """
-    image = gdal.Open(image_path)
-
-    if image is None:
-        print('Could not open ' + image_path)
-        sys.exit(1)
-
-    cols = image.RasterXSize
-    rows = image.RasterYSize
-    geotransform = image.GetGeoTransform()
-    proj = image.GetProjection()
-    
-    minx = geotransform[0]
-    maxy = geotransform[3]
-    maxx = minx + geotransform[1] * cols
-    miny = maxy + geotransform[5] * rows
-
-    X_Y_raster_size = [cols, rows]
-    extent = [minx, miny, maxx, maxy]
-
-    information = {
-        'geotransform': geotransform,
-        'extent': extent,
-        'X_Y_raster_size': X_Y_raster_size,
-        'projection': proj
-    }
-
-    return image, information
+LOGGER = logging.getLogger(__name__)
+PRODUCT = "VNP10A1F"
+UNAVAILABLE_VALUE = 205.0
+DEFAULT_WATER_MASK = (
+    Path(__file__).resolve().parent.parent / "aux" / "Water_Mask_aligned.tif"
+)
+GRANULE_DATE_PATTERN = re.compile(r"^VNP10A1F\.A(?P<date>\d{7})(?:\.|$)")
+SINUSOIDAL_RADIUS_PATTERN = re.compile(
+    r"ProjParams=\(\s*(?P<radius>[0-9.]+)", re.IGNORECASE
+)
 
 
+def _decode_metadata(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
-def read_vnp10a1f(filename):
-    """
-    Reads a VNP10A1F HDF5 file and converts it into an xarray.Dataset
-    containing NDSI-related variables.
 
-    Parameters:
-    -----------
-    filename : str
-        Path to the HDF5 file.
+def _source_crs(hdf: h5py.File) -> CRS:
+    """Build the sinusoidal CRS described by the HDF-EOS metadata."""
+    try:
+        metadata_value = hdf["HDFEOS INFORMATION"]["StructMetadata.0"][()]
+    except KeyError as error:
+        raise ValueError("HDF file has no HDF-EOS structural metadata") from error
 
-    Returns:
-    --------
-    ds : xarray.Dataset
-        An xarray dataset containing:
-        - 'CGF_NDSI_Snow_Cover': DataArray representing the CGF_NDSI_Snow_Cover field.
-        - 'Daily_NDSI_Snow_Cover': DataArray representing the Daily_NDSI_Snow_Cover field.
-    
-    Dataset Attributes:
-    -------------------
-    - The dataset includes spatial coordinates (x, y).
-    - A sinusoidal projection is defined for geospatial reference.
-    - The transform and CRS (Coordinate Reference System) are embedded in the dataset using rasterio.
+    metadata = _decode_metadata(metadata_value)
+    if "Projection=HE5_GCTP_SNSOID" not in metadata:
+        raise ValueError("HDF grid does not declare the expected sinusoidal projection")
 
-    Notes:
-    ------
-    - The function reads two variables: 'CGF_NDSI_Snow_Cover' and 'Daily_NDSI_Snow_Cover'.
-    - The projection information is based on a sinusoidal projection.
-    - Uses the rasterio and affine transformations for proper geospatial referencing.
+    radius_match = SINUSOIDAL_RADIUS_PATTERN.search(metadata)
+    if radius_match is None:
+        raise ValueError("HDF sinusoidal projection does not declare a sphere radius")
+    radius = float(radius_match.group("radius"))
+    return CRS.from_proj4(
+        f"+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R={radius} +units=m +no_defs"
+    )
 
-    For details about the dataset, check: https://nsidc.org/data/vnp10a1f/versions/2
-    """
-    # Open the HDF5 file
-    f = h5py.File(filename, 'r')
 
-    # Read the variables of interest
-    CGF_NDSI_Snow_Cover = np.array(f['HDFEOS']['GRIDS']['VIIRS_Grid_IMG_2D']['Data Fields']['CGF_NDSI_Snow_Cover'])
-    Daily_NDSI_Snow_Cover = np.array(f['HDFEOS']['GRIDS']['VIIRS_Grid_IMG_2D']['Data Fields']['Daily_NDSI_Snow_Cover'])
+def _regular_spacing(values: np.ndarray, name: str) -> float:
+    if values.ndim != 1 or values.size < 2:
+        raise ValueError(f"{name} must be a one-dimensional coordinate array")
+    differences = np.diff(values.astype(np.float64))
+    spacing = float(differences[0])
+    if spacing == 0 or not np.allclose(differences, spacing):
+        raise ValueError(f"{name} coordinates are not regularly spaced")
+    return spacing
 
-    # Define the projection (sinusoidal)
-    projInfo = 'PROJCS["unnamed",GEOGCS["Unknown datum based upon the custom spheroid", DATUM["Not specified (based on custom spheroid)", SPHEROID["Custom spheroid",6371007.181,0]],PRIMEM["Greenwich",0], UNIT["degree",0.0174532925199433]], PROJECTION["Sinusoidal"],PARAMETER["longitude_of_center",0],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["Meter",1]]',\
-               'GEOGCS["Unknown datum based upon the Clarke 1866 ellipsoid", DATUM["Not specified (based on Clarke 1866 spheroid)", SPHEROID["Clarke 1866",6378206.4,294.9786982139006]], PRIMEM["Greenwich",0], UNIT["degree",0.0174532925199433]]'
 
-    # Read x and y coordinates
-    XDim = np.array(f['HDFEOS']['GRIDS']['VIIRS_Grid_IMG_2D']['XDim'])
-    YDim = np.array(f['HDFEOS']['GRIDS']['VIIRS_Grid_IMG_2D']['YDim'])
+def read_vnp10a1f(filename: str | Path) -> xr.Dataset:
+    """Read the cloud-gap-filled NDSI layer and its georeferencing."""
+    path = Path(filename)
+    if not path.is_file():
+        raise FileNotFoundError(f"Input granule does not exist: {path}")
 
-    # Compute geotransform
-    geotransform = (XDim[0], XDim[1] - XDim[0], 0, YDim[0], 0, YDim[1] - YDim[0])
+    with h5py.File(path, "r") as hdf:
+        try:
+            grid = hdf["HDFEOS"]["GRIDS"]["VIIRS_Grid_IMG_2D"]
+            field = grid["Data Fields"]["CGF_NDSI_Snow_Cover"]
+            values = np.asarray(field)
+            x_edges = np.asarray(grid["XDim"], dtype=np.float64)
+            y_edges = np.asarray(grid["YDim"], dtype=np.float64)
+            fill_value = int(np.asarray(field.attrs.get("_FillValue", 255)).item())
+            crs = _source_crs(hdf)
+        except KeyError as error:
+            raise ValueError(f"Missing required VNP10A1F dataset in {path}") from error
 
-    # Function to prepare a DataArray
-    def prepare_dataarray(array, varname):
-        da = xr.DataArray(
-            name=varname,
-            data=array,
-            dims=["y", "x"],
-            coords=dict(
-                y=(["y"], YDim + (YDim[1] - YDim[0]) / 2),
-                x=(["x"], XDim + (XDim[1] - XDim[0]) / 2)
-            ),
-            attrs=dict(
-                transform=Affine.from_gdal(*geotransform),
-                crs=projInfo
-            ),
+    if values.shape != (y_edges.size, x_edges.size):
+        raise ValueError(
+            f"Data shape {values.shape} does not match coordinate dimensions "
+            f"({y_edges.size}, {x_edges.size}) in {path}"
         )
-        return da
 
-    # Create xarray Dataset
-    ds = xr.Dataset({
-        'CGF_NDSI_Snow_Cover': prepare_dataarray(CGF_NDSI_Snow_Cover, 'CGF_NDSI_Snow_Cover'),
-        'Daily_NDSI_Snow_Cover': prepare_dataarray(Daily_NDSI_Snow_Cover, 'Daily_NDSI_Snow_Cover')
-    })
+    x_resolution = _regular_spacing(x_edges, "XDim")
+    y_resolution = _regular_spacing(y_edges, "YDim")
+    if x_resolution <= 0 or y_resolution >= 0:
+        raise ValueError("Expected eastward XDim and north-to-south YDim coordinates")
 
-    # Set CRS and transform using rasterio
-    ds.rio.write_crs(projInfo, inplace=True) \
-        .rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True) \
-        .rio.write_coordinate_system(inplace=True) \
-        .rio.write_transform(Affine.from_gdal(*geotransform))
+    transform = Affine(
+        x_resolution,
+        0,
+        float(x_edges[0]),
+        0,
+        y_resolution,
+        float(y_edges[0]),
+    )
+    data = xr.DataArray(
+        values,
+        name="CGF_NDSI_Snow_Cover",
+        dims=("y", "x"),
+        coords={
+            "x": x_edges + x_resolution / 2,
+            "y": y_edges + y_resolution / 2,
+        },
+        attrs={"long_name": "Cloud-gap-filled NDSI snow cover"},
+    )
+    data.rio.write_crs(crs, inplace=True)
+    data.rio.write_transform(transform, inplace=True)
+    data.rio.write_nodata(fill_value, inplace=True)
+    return data.to_dataset()
 
-    return ds
+
+def _target_crs(epsg_target: str | int | CRS) -> CRS:
+    if isinstance(epsg_target, CRS):
+        return epsg_target
+    value = str(epsg_target).strip()
+    if value.isdigit():
+        return CRS.from_epsg(int(value))
+    return CRS.from_user_input(value)
 
 
+def _reference_grid(image_path: str | Path) -> tuple[tuple[float, ...], CRS]:
+    path = Path(image_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Reference image does not exist: {path}")
+    with rasterio.open(path) as source:
+        if source.crs is None:
+            raise ValueError(f"Reference image has no CRS: {path}")
+        bounds = source.bounds
+        extent = (bounds.left, bounds.bottom, bounds.right, bounds.top)
+        return extent, source.crs
 
-def get_scf_viirs(fileList, outdir, res=500, img4ext=None, extent_target=None, 
-                  epsg_target=None, ow=False):
-    """
-    Reads VIIRS snow cover fraction (SCF) data from HDF files, performs 
-    resampling and reprojection, and saves the output as GeoTIFF.
 
-    Parameters:
-    -----------
-    fileList : list
-        List of paths to the input HDF files.
-    outdir : str
-        Directory where the output GeoTIFF files will be saved.
-    res : int, optional (default=500)
-        Spatial resolution (in meters) of the output image.
-    img4ext : str, optional
-        Path to an image file for reading the target extent and CRS.
-    extent_target : tuple, optional
-        Manually specified extent in the format (xMin, yMin, xMax, yMax).
-    epsg_target : str, optional
-        EPSG code of the target coordinate system.
-    ow : bool, optional (default=False)
-        Whether to overwrite existing output files.
+def _validate_extent(
+    extent: Sequence[float], resolution: float
+) -> tuple[tuple[float, float, float, float], int, int]:
+    if resolution <= 0 or not np.isfinite(resolution):
+        raise ValueError("Output resolution must be a finite number greater than zero")
+    if len(extent) != 4:
+        raise ValueError("Extent must contain xmin, ymin, xmax, and ymax")
 
-    Returns:
-    --------
-    None : NoneType
-        Outputs are saved as GeoTIFF files in the specified directory.
+    xmin, ymin, xmax, ymax = (float(value) for value in extent)
+    if not np.isfinite((xmin, ymin, xmax, ymax)).all():
+        raise ValueError("Extent coordinates must be finite")
+    if xmin >= xmax or ymin >= ymax:
+        raise ValueError("Extent must satisfy xmin < xmax and ymin < ymax")
 
-    Notes:
-    ------
-    - If `img4ext` is provided, it determines the extent and EPSG from the given image.
-    - If `img4ext` is not provided, `extent_target` and `epsg_target` must be specified.
-    - The function reprojects and resamples the NDSI snow cover data.
-    - Cloud mask values are retained as 205 in the output.
-    - The snow cover fraction is computed using: `SCF = (-0.01 + 1.45 * NDSI) * 100`
-      with values capped between 0 and 100.
-    """
-    
-    if img4ext:
-        print('Reading extent and EPSG from reference image...')
-        ds, info = open_image(img4ext)
-        
-        # Extract target EPSG
-        srOut = osr.SpatialReference(str(info['projection']))
-        epsg = 'EPSG:' + srOut.GetAttrValue("AUTHORITY", 1)   
-        
+    columns_exact = (xmax - xmin) / resolution
+    rows_exact = (ymax - ymin) / resolution
+    columns = round(columns_exact)
+    rows = round(rows_exact)
+    if not np.isclose(columns_exact, columns, rtol=0, atol=1e-7) or not np.isclose(
+        rows_exact, rows, rtol=0, atol=1e-7
+    ):
+        raise ValueError(
+            "Extent width and height must be exact multiples of the output resolution"
+        )
+    return (xmin, ymin, xmax, ymax), columns, rows
+
+
+def _target_template(
+    extent: Sequence[float], resolution: float, crs: CRS
+) -> xr.DataArray:
+    (xmin, _ymin, _xmax, ymax), columns, rows = _validate_extent(
+        extent, resolution
+    )
+    x = xmin + (np.arange(columns, dtype=np.float64) + 0.5) * resolution
+    y = ymax - (np.arange(rows, dtype=np.float64) + 0.5) * resolution
+    template = xr.DataArray(
+        np.zeros((rows, columns), dtype=np.uint8),
+        coords={"y": y, "x": x},
+        dims=("y", "x"),
+    )
+    template.rio.write_crs(crs, inplace=True)
+    template.rio.write_transform(
+        Affine(resolution, 0, xmin, 0, -resolution, ymax), inplace=True
+    )
+    return template
+
+
+def _granule_output_date(filename: str | Path) -> str:
+    match = GRANULE_DATE_PATTERN.match(Path(filename).name)
+    if match is None:
+        raise ValueError(f"Unrecognized {PRODUCT} filename: {Path(filename).name}")
+    try:
+        return datetime.strptime(match.group("date"), "%Y%j").strftime("%Y%m%d")
+    except ValueError as error:
+        raise ValueError(f"Invalid acquisition date in {Path(filename).name}") from error
+
+
+def _conservative_invalid_mask(
+    source: xr.DataArray, template: xr.DataArray
+) -> xr.DataArray:
+    """Mark targets touched by any invalid bilinear source contribution."""
+    # Both 0 and 1 are real data here: GDAL must not exclude invalid pixels
+    # from interpolation as it normally does for a source nodata value.
+    invalid_source = np.asarray(
+        (source.values < 0) | (source.values > 100), dtype=np.float32
+    )
+    # Initialize to invalid so pixels outside the source footprint remain masked.
+    invalid_target = np.ones(template.shape, dtype=np.float32)
+    reproject(
+        source=invalid_source,
+        destination=invalid_target,
+        src_transform=source.rio.transform(),
+        src_crs=source.rio.crs,
+        src_nodata=None,
+        dst_transform=template.rio.transform(),
+        dst_crs=template.rio.crs,
+        dst_nodata=1.0,
+        resampling=Resampling.bilinear,
+        init_dest_nodata=True,
+    )
+    # Bilinear weights are non-negative, so any positive result means at least
+    # one invalid source pixel contributed with nonzero weight.
+    return xr.DataArray(
+        invalid_target > 0,
+        coords=template.coords,
+        dims=template.dims,
+        name="invalid_contribution",
+    )
+
+
+def _read_water_mask(
+    mask_path: str | Path, template: xr.DataArray
+) -> xr.DataArray:
+    """Read a water mask that is already aligned to the target grid."""
+    path = Path(mask_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Water mask does not exist: {path}")
+
+    with rasterio.open(path) as source:
+        if source.count < 1:
+            raise ValueError(f"Water mask has no raster bands: {path}")
+        if source.crs is None:
+            raise ValueError(f"Water mask has no coordinate reference system: {path}")
+        if source.shape != template.shape:
+            raise ValueError(
+                f"Water mask shape {source.shape} does not match target shape "
+                f"{template.shape}: {path}"
+            )
+        if source.crs != template.rio.crs:
+            raise ValueError(f"Water mask CRS does not match the target grid: {path}")
+        if source.transform != template.rio.transform():
+            raise ValueError(
+                f"Water mask transform does not match the target grid: {path}"
+            )
+        water = source.read(1) == 1
+
+    return xr.DataArray(
+        water,
+        coords=template.coords,
+        dims=template.dims,
+        name="water_mask",
+    )
+
+
+def _write_raster_atomically(data: xr.DataArray, destination: Path) -> None:
+    """Write and validate a TIFF before moving it into its final location."""
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.stem}.",
+            suffix=".tmp.tif",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+
+        data.rio.to_raster(
+            temporary_path,
+            driver="GTiff",
+            dtype="float32",
+            compress="DEFLATE",
+            predictor=3,
+            tiled=True,
+        )
+        with rasterio.open(temporary_path) as output:
+            if output.width != data.sizes["x"] or output.height != data.sizes["y"]:
+                raise RuntimeError("Written raster has unexpected dimensions")
+            if output.crs != data.rio.crs:
+                raise RuntimeError("Written raster has an unexpected CRS")
+            if output.nodata is not None:
+                raise RuntimeError("Written raster unexpectedly declares a no-data value")
+
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def get_scf_viirs(
+    fileList: Sequence[str | Path],
+    outdir: str | Path,
+    res: float = 500,
+    img4ext: str | Path | None = None,
+    extent_target: Sequence[float] | None = None,
+    epsg_target: str | int | CRS | None = None,
+    ow: bool = False,
+    water_mask: str | Path | None = DEFAULT_WATER_MASK,
+) -> list[Path]:
+    """Reproject VNP10A1F granules and save snow-cover-fraction TIFFs."""
+    output_directory = Path(outdir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    if img4ext is not None:
+        extent, target_crs = _reference_grid(img4ext)
     else:
-        if epsg_target is None:
-            print('Please specify the target EPSG or provide a reference image.')
-            return
-        if extent_target is None:
-            print('Please specify the target extent or provide a reference image.')
-            return
-        epsg = 'EPSG:' + epsg_target
-        info = {'extent': list(extent_target)}
+        if extent_target is None or epsg_target is None:
+            raise ValueError(
+                "Provide img4ext, or provide both extent_target and epsg_target"
+            )
+        extent = tuple(extent_target)
+        target_crs = _target_crs(epsg_target)
 
-    # Compute grid dimensions
-    nx = int((info['extent'][2] - info['extent'][0]) / res)
-    ny = int((info['extent'][3] - info['extent'][1]) / res)
-
-    # Create target grid
-    x = np.linspace(info['extent'][0] + res / 2, info['extent'][2] - res / 2, nx)
-    y = np.flip(np.linspace(info['extent'][1] + res / 2, info['extent'][3] - res / 2, ny))
-    
-    # Initialize an empty dataset
-    ones = np.ones((ny, nx))
-    output_da = xr.DataArray(ones, coords=[y, x], dims=["y", "x"])
-    output_da.rio.write_crs(epsg, inplace=True)
-
+    template = _target_template(extent, res, target_crs)
+    water_target = (
+        _read_water_mask(water_mask, template)
+        if water_mask is not None
+        else xr.zeros_like(template, dtype=bool).rename("water_mask")
+    )
+    LOGGER.info(
+        "Water mask marks %d target pixel(s) as unavailable",
+        int(water_target.sum().item()),
+    )
+    outputs: list[Path] = []
     for filename in fileList:
-        print(f'Processing {filename}')
-        
-        # Generate output filename
-        date = os.path.basename(filename).split('.')[1][1:] 
-        new_date = dt.strptime(date, '%Y%j').strftime('%Y%m%d')
-        fileName_output = os.path.join(outdir, f'EURAC_SNOW_MERGE.alps.south-tyrol.{new_date}T120000.vnp10a1f.tif')
-        # fileName_output = os.path.join(outdir, f'VNP10A1F_{new_date}.tif')
-
-        # Skip existing files if overwrite is False
-        if os.path.exists(fileName_output) and not ow:
-            print(f'File {fileName_output} already exists. Set `ow=True` to overwrite.')
-            continue  
-        
-        # Read VIIRS dataset
-        viirs_ds = read_vnp10a1f(filename)
-
-        # Reproject NDSI Snow Cover
-        ndsi = viirs_ds['CGF_NDSI_Snow_Cover'].where(viirs_ds['CGF_NDSI_Snow_Cover']<=100).rio.reproject(epsg, resampling=Resampling.bilinear) / 100
-        # ndsi = viirs_ds['CGF_NDSI_Snow_Cover'].rio.reproject(epsg, resampling=Resampling.bilinear) / 100
-
-        
-        # Reproject cloud mask
-        cloud = viirs_ds['CGF_NDSI_Snow_Cover'].rio.reproject(epsg, resampling=Resampling.nearest)
-        cloud_rsmp = cloud.rio.reproject_match(output_da, resampling=Resampling.nearest)
-        
-        # Skip files with only invalid values
-        if (cloud_rsmp.values[cloud_rsmp.values > 100] == 0).all():
+        input_path = Path(filename)
+        output_date = _granule_output_date(input_path)
+        output_path = output_directory / (
+            "EURAC_SNOW_MERGE.alps.south-tyrol."
+            f"{output_date}T120000.vnp10a1f.tif"
+        )
+        if output_path.exists() and not ow:
+            LOGGER.info("Skipping existing output %s", output_path)
             continue
-        
-        # Resample NDSI
-        ndsi_rsmp = ndsi.rio.reproject_match(output_da, resampling=Resampling.cubic)
 
-        # Compute Snow Cover Fraction (SCF)
-        scf = (-0.01 + 1.45 * ndsi_rsmp) * 100
-        scf = scf.where((scf< 100) | (np.isnan(scf)), other=100).where((scf > 0) | (np.isnan(scf)), other=0)
-        scf = scf.where(cloud_rsmp <= 100, other=205)
-        scf = scf.fillna(205)
-        
-        # Save output as GeoTIFF
-        scf.rio.to_raster(fileName_output)
+        LOGGER.info("Processing %s", input_path)
+        source = read_vnp10a1f(input_path)["CGF_NDSI_Snow_Cover"]
 
+        invalid_target = _conservative_invalid_mask(source, template)
+        valid_target = ~invalid_target & ~water_target
+        has_valid_data = bool(valid_target.any().item())
 
+        ndsi = source.where((source >= 0) & (source <= 100)).astype(np.float32) / 100
+        ndsi.rio.write_nodata(np.nan, inplace=True)
+        ndsi_target = ndsi.rio.reproject_match(
+            template, resampling=Resampling.bilinear, nodata=np.nan
+        )
+
+        scf = ((-0.01 + 1.45 * ndsi_target) * 100).clip(min=0, max=100)
+        scf = scf.where(valid_target, other=UNAVAILABLE_VALUE).fillna(
+            UNAVAILABLE_VALUE
+        )
+        scf = scf.astype(np.float32).rename("snow_cover_fraction")
+        scf.attrs.update(
+            {
+                "long_name": "Snow cover fraction",
+                "units": "percent",
+                "unavailable_value": UNAVAILABLE_VALUE,
+                "water_mask": str(water_mask) if water_mask is not None else "none",
+            }
+        )
+        scf.rio.write_crs(target_crs, inplace=True)
+        scf.rio.write_nodata(None, encoded=True, inplace=True)
+
+        if not has_valid_data:
+            LOGGER.warning(
+                "%s has no valid pixels in the target area; writing an all-205 raster",
+                input_path.name,
+            )
+
+        _write_raster_atomically(scf, output_path)
+        outputs.append(output_path)
+
+    return outputs
