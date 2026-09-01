@@ -90,7 +90,10 @@ def get_sca_metrics(array, snow, nosnow, cloud, nodata):
     """
     
     # Compute pixel counts
-    cloudPixels = np.sum(array == cloud) + np.sum(array == nodata)
+    # Count the union of cloud and nodata pixels. This supports products where
+    # they use distinct class values without double-counting when both values
+    # are the same (for example, VIIRS uses 205 for both).
+    cloudPixels = np.sum((array == cloud) | (array == nodata))
 
     if type(snow) is list:
         validPixels = np.sum(array <= snow[1]) 
@@ -236,11 +239,20 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fil
             df = pd.read_csv(csv_path)
             df.index = pd.to_datetime(df['Unnamed: 0'], format='%Y-%m-%d') if 'Unnamed: 0' in df.columns else None
             df.drop(columns='Unnamed: 0', errors='ignore', inplace=True)  # Remove the 'Unnamed: 0' column if it exists
-            dateStart = df.index[-1].date() if df is not None else datetime.datetime.min.date()
-            print(f'The old CSV contains data till {dateStart}')
-            
-            # Filter files based on the date in the filename
-            snowMap_fileNameList = [f for f in snowMap_fileNameList if dateFromFileName(f) > dateStart]
+            df.sort_index(inplace=True)
+            existing_dates = set(df.index.date)
+            if existing_dates:
+                print(f'The old CSV contains data till {max(existing_dates)}')
+
+            # Process every raster date that is absent from the CSV. Comparing
+            # against the complete index (rather than only its last date) lets
+            # later runs backfill granules that arrived late or previously
+            # failed during processing.
+            snowMap_fileNameList = [
+                f
+                for f in snowMap_fileNameList
+                if dateFromFileName(f) not in existing_dates
+            ]
         
         except Exception as e:
             print(f"Error reading or processing CSV: {e}")
@@ -294,6 +306,11 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fil
         updated_df = pd.concat([df, newdf], axis=0)
     else:
         updated_df = newdf
+
+    # Keep a chronological, unique time series even when the input contains
+    # duplicate rasters for the same acquisition date.
+    updated_df = updated_df[~updated_df.index.duplicated(keep='last')]
+    updated_df.sort_index(inplace=True)
 
     # Write the updated data to the CSV file
     updated_df.to_csv(csv_path)
@@ -467,6 +484,7 @@ def snow_bullettin(pathToCSV,
     plt.savefig(os.path.join(work_folder, f"snow_bulletin_{date_start}_{date_end}_{suffix}.png"), bbox_inches="tight")
 
     return newdf
+
 
 
 
@@ -951,4 +969,3 @@ def calculate_trends(csv_name):
     mk.original_test(newdf['Mean(Nov-Apr)'].dropna())
 
     return newdf
-

@@ -1,6 +1,18 @@
 # sca4provbz
 
-This repository contains:
+Tools for producing and analysing snow-cover products for South Tyrol for the Risk Monitoring project.
 
-- a repository viirs with scripts to download the VNP10A1 product (see https://nsidc.org/data/vnp10a1/versions/2) and extract snow cover fraction (SCF) for the area of South Tyrol with the extent required by the province for the Risk Monitoring project and a resolution of 250 m. This script first downloads h5 raw files and then they are cut to the area of interest. It also applies a water mask to the final tif files.
+## Main Repositories
+
+- `viirs/`: downloads NASA VNP10A1F version 2 granules and converts them
+  into daily snow-cover-fraction (SCF) GeoTIFFs at 250 m resolution. The
+  output grid uses EPSG:32632 and the extent required by the Province of
+  Bolzano. Water pixels are assigned the unavailable value `205` using the
+  pre-aligned mask `aux/Water_Mask_aligned.tif`.
+- `snow_bullettin/`: updates the daily snow-cover-area (SCA) time series,
+  creates the operational snow bulletin, and computes monthly, quarterly and
+  yearly snow-cover-duration (SCD) products.
+- `snow_bullettin_old/` and `viirs_old/`: previous workflow versions retained
+  for reference.
+
 

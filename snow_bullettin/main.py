@@ -59,6 +59,8 @@ print("--- %s seconds ---" % (time.time() - start_time))
 """
 SNOW BULLETTIN: Create daily plot with current SCA, mean SCA, min and max 
                 (or percentiles: check the function!)
+                
+    To be run every 15 days
 """
 
 
@@ -86,6 +88,7 @@ statistics = snow_bullettin(csv_path, date_start, date_end, snow_bullettin_dir, 
 
 """
 SNOW COVER DURATION (SCD)
+    To be run every month 
 """
 outdir_y = os.path.join(wd, f"scd/{suffix}/yearly")
 outdir_m = os.path.join(wd, f"scd/{suffix}/monthly")
