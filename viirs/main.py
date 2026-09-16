@@ -27,10 +27,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_AOI = PROJECT_ROOT / "aux" / "SouthTyrol.geojson"
 DEFAULT_WATER_MASK = PROJECT_ROOT / "aux" / "Water_Mask_aligned.tif"
-DEFAULT_DOWNLOAD_DIR = Path("/mnt/CEPH_PROJECTS/PROSNOW/raw_data/VIIRS/VNP10A1F")
-DEFAULT_OUTPUT_DIR = Path(
-    "/mnt/CEPH_PROJECTS/PROSNOW/4.results/VNP10A1F_SouthTyrol"
-)
+DEFAULT_DOWNLOAD_DIR = Path("/mnt/CEPH_PRODUCTS/EURAC_SNOW/VNP10A1F/input")
+DEFAULT_OUTPUT_DIR = Path("/mnt/CEPH_PRODUCTS/EURAC_SNOW/VNP10A1F/ST")
 DEFAULT_EXTENT = (597972.0, 5117987.0, 767972.0, 5221987.0)
 DEFAULT_ARCHIVE_START_DATE = date(2012, 1, 19)
 
@@ -174,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite", action="store_true", help="Overwrite existing SCF rasters"
     )
     parser.add_argument(
+        "--cleanup-downloads",
+        action="store_true",
+        help="Delete granules downloaded by this run after successful processing",
+    )
+    parser.add_argument(
         "--max-results",
         type=int,
         default=-1,
@@ -211,6 +214,7 @@ def run(args: argparse.Namespace, scf_processor: Callable[..., object]) -> int:
     )
 
     existing = discover_granules(args.download_dir)
+    downloaded_granules: set[Path] = set()
     local_dates = {granule_date(path) for path in existing}
     missing_raw_dates = dates_to_process - local_dates
 
@@ -237,7 +241,11 @@ def run(args: argparse.Namespace, scf_processor: Callable[..., object]) -> int:
             )
             LOGGER.info("Found %d matching granule(s)", len(results))
             if results:
+                granules_before_download = set(discover_granules(args.download_dir))
                 earthaccess.download(results, args.download_dir)
+                downloaded_granules.update(
+                    set(discover_granules(args.download_dir)) - granules_before_download
+                )
 
     granules = [
         path
@@ -268,6 +276,14 @@ def run(args: argparse.Namespace, scf_processor: Callable[..., object]) -> int:
         ow=args.overwrite,
         water_mask=args.water_mask,
     )
+
+    if getattr(args, "cleanup_downloads", False):
+        LOGGER.info(
+            "Removing %d granule(s) downloaded by this run",
+            len(downloaded_granules),
+        )
+        for path in sorted(downloaded_granules):
+            path.unlink(missing_ok=True)
 
     return 0
 
