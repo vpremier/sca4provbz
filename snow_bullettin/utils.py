@@ -209,7 +209,13 @@ def apply_mask(snowMap, shp_fileName=None, mask_raster_fileName=None):
 
 
                 
-def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fileName=None):
+def updateCSV(
+    csv_path,
+    snowMap_fileNameList,
+    shp_fileName=None,
+    mask_raster_fileName=None,
+    return_processed_dates=False,
+):
     """
     This function updates or creates a CSV with new data based on files in a given folder.
 
@@ -225,6 +231,9 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fil
         Path to the shapefile, if needed for spatial processing.
     mask_raster_fileName : str, optional
         Path to a raster file to use as an additional mask.
+    return_processed_dates : bool, optional
+        If true, return ``(dataframe, processed_dates)`` so callers can identify
+        which periods need dependent products to be recalculated.
     """
     
     # Initialize the DataFrame and date range
@@ -256,7 +265,7 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fil
         
         except Exception as e:
             print(f"Error reading or processing CSV: {e}")
-            return
+            return (None, set()) if return_processed_dates else None
     
     else:
         print('The CSV file does not exist. A new one will be created.')
@@ -294,7 +303,7 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fil
     
     if not new_data:
         print("No new data to add.")
-        return df
+        return (df, set()) if return_processed_dates else df
 
     # Create a DataFrame from the collected new data
     newdf = pd.DataFrame(data=[item[1] for item in new_data], index=[item[0] for item in new_data])
@@ -315,7 +324,10 @@ def updateCSV(csv_path, snowMap_fileNameList, shp_fileName=None, mask_raster_fil
     # Write the updated data to the CSV file
     updated_df.to_csv(csv_path)
     print(f"CSV file {csv_path} has been updated")
-    
+
+    processed_dates = {item[0] for item in new_data}
+    if return_processed_dates:
+        return updated_df, processed_dates
     return updated_df
     
     
@@ -670,7 +682,7 @@ def get_scd(snowMap_fileNameList, date_start, date_end, shp_fileName=None, windo
 
 def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30, 
                        shp_fileName=None, window=2, mode="yearly", 
-                       save=True, ow=False):
+                       save=True, ow=False, overwrite_periods=None):
     """
     Computes Snow Cover Duration (SCD) statistics for either full seasons (yearly) or individual months.
 
@@ -691,6 +703,10 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
         Whether to save as GeoTIFF or not the snow cover duration maps.
     ow: bool, optional
         Whether to overwrite or not the output GeoTiff maps.
+    overwrite_periods : collection of str, optional
+        Period keys to selectively recalculate even when their output exists.
+        Keys use ``YYYY-YYYY`` for yearly, ``YYYY-MM`` for monthly, and
+        ``YYYY-TN`` for trimester outputs.
 
     Returns:
     --------
@@ -700,6 +716,7 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
     """
     
     today = dt.today()
+    overwrite_periods = set(overwrite_periods or ())
     
     # Extract dates from filenames
     dates = sorted([dateFromFileName(f) for f in snowMap_fileNameList])
@@ -728,9 +745,10 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
             date_start = pd.Timestamp(year=year, month=10, day=1).date()  # 1st October
             date_end = pd.Timestamp(year=year + 1, month=9, day=30).date()  # 30th September
             
+            period_key = f"{year}-{year+1}"
             outname = os.path.join(outdir, f'scd_{year}_{year+1}.tif')
             
-            if not os.path.exists(outname) or ow:
+            if not os.path.exists(outname) or ow or period_key in overwrite_periods:
                 
                 # Filter files for this season
                 season_files = [f for f in snowMap_fileNameList if date_start <= dateFromFileName(f) <= date_end]
@@ -767,9 +785,10 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
             date_end = pd.Timestamp(year=date.year, month=date.month, 
                                     day=pd.Period(date, freq='D').days_in_month).date()
             
-            outname = os.path.join(outdir, f"{date.strftime('%Y-%m')}.tif")
+            period_key = date.strftime('%Y-%m')
+            outname = os.path.join(outdir, f"{period_key}.tif")
             
-            if not os.path.exists(outname) or ow:
+            if not os.path.exists(outname) or ow or period_key in overwrite_periods:
     
     
                 # Filter files for this month
@@ -808,9 +827,10 @@ def get_scd_statistics(snowMap_fileNameList, outdir, max_missing_days=30,
                 continue
     
             tnum = ((q_start.month - 1) // 3) + 1
-            outname = os.path.join(outdir, f"{q_start.year}-T{tnum}.tif")
+            period_key = f"{q_start.year}-T{tnum}"
+            outname = os.path.join(outdir, f"{period_key}.tif")
     
-            if not os.path.exists(outname) or ow:
+            if not os.path.exists(outname) or ow or period_key in overwrite_periods:
                 trimester_files = [f for f in snowMap_fileNameList
                                    if q_start.date() <= dateFromFileName(f) <= q_end.date()]
     

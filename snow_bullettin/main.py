@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import datetime as dt
+from datetime import date, datetime as dt
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +63,18 @@ def discover_rasters(input_dir: Path) -> list[Path]:
     return sorted(input_dir.rglob(RASTER_PATTERN))
 
 
+def affected_scd_periods(days: Iterable[date]) -> dict[str, set[str]]:
+    """Map newly processed dates to their monthly, quarterly, and snow seasons."""
+    periods = {"monthly": set(), "trimester": set(), "yearly": set()}
+    for day in days:
+        periods["monthly"].add(day.strftime("%Y-%m"))
+        trimester = ((day.month - 1) // 3) + 1
+        periods["trimester"].add(f"{day.year}-T{trimester}")
+        season_start = day.year if day.month >= 10 else day.year - 1
+        periods["yearly"].add(f"{season_start}-{season_start + 1}")
+    return periods
+
+
 def run(args: argparse.Namespace) -> int:
     # Keep the geospatial dependencies out of argument parsing so --help remains
     # available even when the processing environment is not loaded.
@@ -102,10 +114,11 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"Processing {args.product}: {len(snow_maps)} raster(s) from {input_dir}")
     start_time = time.time()
-    sca_data = updateCSV(
+    sca_data, processed_dates = updateCSV(
         str(csv_path),
         [str(path) for path in snow_maps],
         shp_fileName=args.aoi,
+        return_processed_dates=True,
     )
     print(f"SCA statistics updated in {time.time() - start_time:.1f} seconds")
 
@@ -131,6 +144,12 @@ def run(args: argparse.Namespace) -> int:
 
     scd_root = args.work_dir / "SCD" / suffix
     snow_map_names = [str(path) for path in snow_maps]
+    affected_periods = affected_scd_periods(processed_dates)
+    if processed_dates:
+        print(
+            f"Recalculating SCD periods affected by {len(processed_dates)} "
+            "newly processed map(s)"
+        )
     get_scd_statistics(
         snow_map_names,
         str(scd_root / "trimester"),
@@ -138,6 +157,7 @@ def run(args: argparse.Namespace) -> int:
         shp_fileName=args.aoi,
         window=2,
         mode="trimester",
+        overwrite_periods=affected_periods["trimester"],
     )
     get_scd_statistics(
         snow_map_names,
@@ -146,6 +166,7 @@ def run(args: argparse.Namespace) -> int:
         shp_fileName=args.aoi,
         window=2,
         mode="yearly",
+        overwrite_periods=affected_periods["yearly"],
     )
     scd_monthly = get_scd_statistics(
         snow_map_names,
@@ -154,6 +175,7 @@ def run(args: argparse.Namespace) -> int:
         shp_fileName=args.aoi,
         window=2,
         mode="monthly",
+        overwrite_periods=affected_periods["monthly"],
     )
 
     if scd_monthly:
