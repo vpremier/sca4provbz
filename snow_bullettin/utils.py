@@ -861,7 +861,7 @@ def compute_scd_anomaly(results, target_year):
 
 
 
-def monthly_anomaly_scd(results, outdir):
+def monthly_anomaly_scd(results, outdir, suffix=None):
     # Organize maps by month (e.g., "10" → [Oct_2021, Oct_2022, ...])
     monthly_data = defaultdict(list)
     for key, da in results.items():
@@ -903,7 +903,8 @@ def monthly_anomaly_scd(results, outdir):
     
     plt.suptitle("Monthly Snow Cover Duration Anomalies", fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(os.path.join(outdir, 'SCD_anomalies.png'))
+    filename = f"SCD_anomalies_{suffix}.png" if suffix else "SCD_anomalies.png"
+    plt.savefig(os.path.join(outdir, filename))
     
     
 

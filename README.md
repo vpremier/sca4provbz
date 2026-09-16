@@ -15,4 +15,15 @@ Tools for producing and analysing snow-cover products for South Tyrol for the Ri
 - `snow_bullettin_old/` and `viirs_old/`: previous workflow versions retained
   for reference.
 
+## Snow bulletin command line
+
+Run the bulletin and SCD workflow separately for each product:
+
+```bash
+python snow_bullettin/main.py modis
+python snow_bullettin/main.py viirs
+```
+
+Use `python snow_bullettin/main.py --help` to see options for overriding the
+input directory, output root, or area of interest.
 
